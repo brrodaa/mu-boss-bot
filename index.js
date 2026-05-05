@@ -536,10 +536,23 @@ client.on(Events.InteractionCreate, async interaction => {
     const boss = BOSSES.find(b => b.id === id);
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
 
-    const now = new Date();
-    const kill = new Date(now);
-    kill.setHours(h, m, 0, 0);
-    if (kill > now) kill.setDate(kill.getDate() - 1);
+   const now = new Date();
+
+// Create time in UTC first
+const kill = new Date(Date.UTC(
+  now.getUTCFullYear(),
+  now.getUTCMonth(),
+  now.getUTCDate(),
+  h - 2, // adjust for your timezone (UTC+2)
+  m,
+  0,
+  0
+));
+
+// If it's in the future, move to yesterday
+if (kill.getTime() > now.getTime()) {
+  kill.setUTCDate(kill.getUTCDate() - 1);
+}
 
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
@@ -621,10 +634,22 @@ client.on(Events.InteractionCreate, async interaction => {
     const [h, m] = timeValue.split(":").map(Number);
 
     const now = new Date();
-    const kill = new Date(now);
-    kill.setHours(h, m, 0, 0);
-    if (kill > now) kill.setDate(kill.getDate() - 1);
 
+// Create time in UTC first
+const kill = new Date(Date.UTC(
+  now.getUTCFullYear(),
+  now.getUTCMonth(),
+  now.getUTCDate(),
+  h - 2, // adjust for your timezone (UTC+2)
+  m,
+  0,
+  0
+));
+
+// If it's in the future, move to yesterday
+if (kill.getTime() > now.getTime()) {
+  kill.setUTCDate(kill.getUTCDate() - 1);
+}
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
     data.kills[id] = {
