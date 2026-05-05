@@ -14,7 +14,7 @@ const {
 } = require("discord.js");
 
 const fs = require("fs");
-
+client.login(process.env.BOT_TOKEN);
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
