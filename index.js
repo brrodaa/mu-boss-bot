@@ -407,7 +407,7 @@ client.once(Events.ClientReady, async () => {
   console.log("Bot online");
   load();
 
-  const channel = await client.channels.fetch(config.channelId);
+  const channel = await client.channels.fetch(process.env.CHANNEL_ID);
 
   dashboardMessage = await channel.send({
     embeds: [buildEmbed()],
@@ -747,4 +747,4 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-client.login(config.token);
+client.login(process.env.TOKEN);
