@@ -287,7 +287,7 @@ client.once("ready", async () => {
   load();
   initBossData();
  
-  const channel = await client.channels.fetch(config.channelId);
+  const channel = await client.channels.fetch(CHANNEL_ID);
  
   dashboardMessage = await channel.send({
     embeds: [buildEmbed()],
@@ -423,4 +423,4 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
  
-client.login(config.token);
+client.login(TOKEN);
