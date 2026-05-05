@@ -554,9 +554,11 @@ client.on(Events.InteractionCreate, async interaction => {
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
 
     const now = new Date();
-    const kill = new Date(now);
-    kill.setHours(h, m, 0, 0);
-    if (kill > now) kill.setDate(kill.getDate() - 1);
+const kill = new Date(parseLocalTimeToUTC(h, m));
+
+if (kill.getTime() > Date.now()) {
+  kill.setDate(kill.getDate() - 1);
+}
 
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
@@ -638,9 +640,11 @@ client.on(Events.InteractionCreate, async interaction => {
     const [h, m] = timeValue.split(":").map(Number);
 
     const now = new Date();
-    const kill = new Date(now);
-    kill.setHours(h, m, 0, 0);
-    if (kill > now) kill.setDate(kill.getDate() - 1);
+    const kill = new Date(parseLocalTimeToUTC(h, m));
+
+if (kill.getTime() > Date.now()) {
+  kill.setDate(kill.getDate() - 1);
+}
 
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
