@@ -14,43 +14,17 @@ const {
 } = require("discord.js");
 
 const fs = require("fs");
-
+const config = require("./config.json");
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
-
-
 
 // =====================
 // SETTINGS
 // =====================
 const TICK_RATE = 5000;
 const MAX_UNDO = 10;
-
-function parseServerTimeToDate(hhmm) {
-  const [h, m] = hhmm.split(":").map(Number);
-
-  const now = new Date();
-
-  // Use a single consistent epoch reference (UTC midnight today)
-  const base = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    h,
-    m,
-    0,
-    0
-  ));
-
-  // If parsed time is in the future → assume previous day
-  if (base.getTime() > Date.now()) {
-    base.setUTCDate(base.getUTCDate() - 1);
-  }
-
-  return base;
-}
 
 // =====================
 // STATE
@@ -63,7 +37,6 @@ let spawnWindowMessages = {};
 let adminLogs = [];
 let undoStack = [];
 
-// Dashboard re-pin: re-send after N interactions or N minutes
 const REPIN_AFTER_INTERACTIONS = 3;
 const REPIN_AFTER_MS = 3 * 60 * 1000;
 let interactionCount = 0;
@@ -82,6 +55,53 @@ function buildBosses() {
 }
 
 const BOSSES = buildBosses();
+
+// =====================
+// TIMEZONE HELPER
+// =====================
+const SERVER_TZ = "Europe/Amsterdam";
+
+function getAmsterdamOffsetMs(date) {
+  const utcStr = date.toLocaleString("en-US", { timeZone: "UTC" });
+  const tzStr  = date.toLocaleString("en-US", { timeZone: SERVER_TZ });
+  return new Date(tzStr) - new Date(utcStr);
+}
+
+function parseServerTime(h, m) {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
+  const candidate = new Date(`${dateStr}T${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`);
+  const tzOffset = getAmsterdamOffsetMs(candidate);
+  const utcMs = candidate.getTime() - tzOffset;
+  const kill = new Date(utcMs);
+  if (kill > now) kill.setDate(kill.getDate() - 1);
+  return kill;
+}
+
+// Format a UTC timestamp as HH:MM in server timezone (24h)
+function toServerTimeStr(ms) {
+  return new Date(ms).toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: SERVER_TZ,
+    hour12: false
+  });
+}
+
+// Format a UTC timestamp as HH:MM:SS DD/MM/YYYY in server timezone (24h) — for logs
+function toServerDateTimeStr(ms) {
+  const d = new Date(ms);
+  return d.toLocaleString("en-GB", {
+    timeZone: SERVER_TZ,
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  });
+}
 
 // =====================
 // SAVE / LOAD
@@ -144,7 +164,6 @@ async function announce(channel, user, action, extra = "") {
   const msg = await channel.send(
     `📢 **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`
   );
-  // Auto-delete announcements after 30 minutes
   setTimeout(() => msg.delete().catch(() => {}), 30 * 60 * 1000);
 }
 
@@ -178,7 +197,6 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
 
   spawnWindowMessages[id] = { msg, windowEnd, boss };
 
-  // Delete 15 minutes after the window expires
   const msUntilExpiry = windowEnd - Date.now();
   const deleteAfter = msUntilExpiry + 15 * 60 * 1000;
   setTimeout(() => {
@@ -187,18 +205,12 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
   }, deleteAfter);
 }
 
-// Recreate all currently-active spawn windows (used when dashboard is repinned)
 async function recreateActiveSpawnWindows(channel) {
   const now = Date.now();
-
   for (const id in spawnWindowMessages) {
     const w = spawnWindowMessages[id];
-
-    // Delete the old window message
     w.msg.delete().catch(() => {});
     delete spawnWindowMessages[id];
-
-    // Only recreate if the window is still open
     if (w.windowEnd > now) {
       await createSpawnWindow(w.boss, id, channel, w.windowEnd);
     }
@@ -242,12 +254,11 @@ function buildEmbed() {
       text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${lastKnown}\n👤 ${e.lastKiller}`;
       isBroken = true;
     } else {
-const serverTime = new Date(e.respawnTime)
-  .toISOString()
-  .substring(11, 16);
+      const tsRespawn = Math.floor(e.respawnTime / 1000);
+      const serverTime = toServerTimeStr(e.respawnTime);
       text =
         `🔴 ${format(cooldown)}\n` +
-        `🕒 ServerTime: ${serverTime}\n` +
+        `🕒 Server time: ${serverTime} — Your time: <t:${tsRespawn}:t>\n` +
         `👤 ${e.lastKiller}`;
     }
 
@@ -259,7 +270,6 @@ const serverTime = new Date(e.respawnTime)
     };
   });
 
-  // Broken timers sorted last, rest by time remaining
   bosses.sort((a, b) => {
     if (a.isBroken && !b.isBroken) return 1;
     if (!a.isBroken && b.isBroken) return -1;
@@ -327,7 +337,6 @@ async function repinDashboard(channel) {
   interactionCount = 0;
   lastRepinTime = Date.now();
 
-  // Recreate all active spawn windows alongside the dashboard
   await recreateActiveSpawnWindows(channel);
 }
 
@@ -340,7 +349,6 @@ function startLoop() {
 
     const channel = dashboardMessage.channel;
 
-    // Re-pin by time threshold
     if (Date.now() - lastRepinTime >= REPIN_AFTER_MS) {
       await repinDashboard(channel);
       checkWarnings(channel);
@@ -353,18 +361,15 @@ function startLoop() {
         components: buildButtons()
       });
     } catch (err) {
-      // Message was deleted externally — repin and continue
       if (err.code === 10008) {
         await repinDashboard(channel);
         checkWarnings(channel);
         return;
       }
-      // Ignore other transient errors (rate limit, network blip)
     }
 
     const now = Date.now();
 
-    // Update live spawn window messages
     for (const id in spawnWindowMessages) {
       const w = spawnWindowMessages[id];
       const remaining = w.windowEnd - now;
@@ -450,7 +455,6 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
 
-  // Track interactions and repin dashboard when threshold is hit
   interactionCount++;
   if (interactionCount >= REPIN_AFTER_INTERACTIONS && dashboardMessage) {
     await repinDashboard(dashboardMessage.channel);
@@ -474,7 +478,7 @@ client.on(Events.InteractionCreate, async interaction => {
     };
 
     save();
-    log(interaction.user, `BUTTON: kill → KILLED ${boss.name}`);
+    log(interaction.user, `KILLED ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
 
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
@@ -514,7 +518,7 @@ client.on(Events.InteractionCreate, async interaction => {
     };
 
     save();
-    log(interaction.user, `WINDOW BUTTON: kill → KILLED ${boss.name} (window kill)`);
+    log(interaction.user, `WINDOW KILL ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
 
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
@@ -538,7 +542,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const id = interaction.customId.replace("window_settime_", "");
     const boss = BOSSES.find(b => b.id === id);
 
-    log(interaction.user, `WINDOW BUTTON: set time → opened modal for ${boss.name}`);
+    log(interaction.user, `Opened set-time modal for ${boss.name} (window)`);
 
     const modal = new ModalBuilder()
       .setCustomId("window_killtime_" + id)
@@ -560,10 +564,10 @@ client.on(Events.InteractionCreate, async interaction => {
 
     const id = interaction.customId.replace("window_killtime_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
+    const timeValue = interaction.fields.getTextInputValue("time");
+    const [h, m] = timeValue.split(":").map(Number);
 
-const kill = parseServerTimeToDate(timeValue);
-
+    const kill = parseServerTime(h, m);
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
     if (spawnWindowMessages[id]) {
@@ -578,7 +582,7 @@ const kill = parseServerTimeToDate(timeValue);
     };
 
     save();
-    log(interaction.user, `WINDOW MODAL: set time → MANUAL SET ${boss.name} kill at ${h}:${String(m).padStart(2,"0")}`);
+    log(interaction.user, `MANUAL SET (window) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
 
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
@@ -599,7 +603,7 @@ const kill = parseServerTimeToDate(timeValue);
   // INSERT TIME — step 1: pick boss
   // =====================
   if (interaction.isButton() && interaction.customId === "insert_time") {
-    log(interaction.user, `BUTTON: insert_time → opened boss selection menu`);
+    log(interaction.user, `Opened insert: boss selection menu`);
 
     const menu = new StringSelectMenuBuilder()
       .setCustomId("select_boss_insert")
@@ -613,20 +617,55 @@ const kill = parseServerTimeToDate(timeValue);
     });
   }
 
-  // INSERT TIME — step 2: show modal
+  // INSERT TIME — step 2: pick timezone mode
   if (interaction.isStringSelectMenu() && interaction.customId === "select_boss_insert") {
     const id = interaction.values[0];
     const boss = BOSSES.find(b => b.id === id);
 
-    log(interaction.user, `MENU: select_boss_insert → selected ${boss.name}, opened time modal`);
+    log(interaction.user, `Insert: selected boss ${boss.name}, showing timezone choice`);
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId("select_tzmode_" + id)
+      .setPlaceholder("Which time format will you enter?")
+      .addOptions([
+        {
+          label: "🌍 Server time (HH:MM, 24h)",
+          description: "Enter the kill time in server timezone",
+          value: "server"
+        },
+        {
+          label: "🏠 My local time (HH:MM, 24h)",
+          description: "Enter the kill time in your own timezone",
+          value: "local"
+        }
+      ]);
+
+    return interaction.reply({
+      content: `⏱️ How will you enter the kill time for **${boss.name}**?`,
+      components: [new ActionRowBuilder().addComponents(menu)],
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  // INSERT TIME — step 3: show modal based on chosen mode
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith("select_tzmode_")) {
+    const id = interaction.customId.replace("select_tzmode_", "");
+    const boss = BOSSES.find(b => b.id === id);
+    const mode = interaction.values[0]; // "server" or "local"
+
+    log(interaction.user, `Insert: ${boss.name} — chose ${mode} time input`);
+
+    const label = mode === "server"
+      ? "HH:MM (24h, server time)"
+      : "HH:MM (24h, your local time)";
 
     const modal = new ModalBuilder()
-      .setCustomId("killtime_" + id)
-      .setTitle("Insert Kill Time");
+      .setCustomId(`killtime_${mode}_${id}`)
+      .setTitle(`Insert Kill Time — ${boss.name}`);
 
     const input = new TextInputBuilder()
       .setCustomId("time")
-      .setLabel("HH:MM (24h, server time)")
+      .setLabel(label)
       .setStyle(TextInputStyle.Short);
 
     modal.addComponents(new ActionRowBuilder().addComponents(input));
@@ -634,17 +673,16 @@ const kill = parseServerTimeToDate(timeValue);
     return interaction.showModal(modal);
   }
 
-  // INSERT TIME — step 3: save
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_")) {
+  // INSERT TIME — step 4: save (server time mode)
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_server_")) {
     snapshot();
 
-    const id = interaction.customId.replace("killtime_", "");
+    const id = interaction.customId.replace("killtime_server_", "");
     const boss = BOSSES.find(b => b.id === id);
     const timeValue = interaction.fields.getTextInputValue("time");
     const [h, m] = timeValue.split(":").map(Number);
 
-const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"));
-
+    const kill = parseServerTime(h, m);
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
     data.kills[id] = {
@@ -654,7 +692,7 @@ const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"))
     };
 
     save();
-    log(interaction.user, `MODAL: killtime → MANUAL SET ${boss.name} kill at ${timeValue}`);
+    log(interaction.user, `MANUAL SET (server time) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
 
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
@@ -671,11 +709,53 @@ const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"))
     return interaction.deferUpdate();
   }
 
+  // INSERT TIME — step 4: save (local time mode)
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_local_")) {
+    snapshot();
+
+    const id = interaction.customId.replace("killtime_local_", "");
+    const boss = BOSSES.find(b => b.id === id);
+    const timeValue = interaction.fields.getTextInputValue("time");
+    const [h, m] = timeValue.split(":").map(Number);
+
+    // Treat input as the bot host's local time (i.e. what the user typed as-is)
+    // Discord doesn't expose the user's timezone, so we parse it as local wall clock
+    const now = new Date();
+    const kill = new Date(now);
+    kill.setHours(h, m, 0, 0);
+    if (kill > now) kill.setDate(kill.getDate() - 1);
+
+    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
+
+    data.kills[id] = {
+      killTime: kill.getTime(),
+      respawnTime,
+      lastKiller: interaction.user.username
+    };
+
+    save();
+    log(interaction.user, `MANUAL SET (local time input) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
+
+    spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
+
+    const tsKill = Math.floor(kill.getTime() / 1000);
+    const tsRespawn = Math.floor(respawnTime / 1000);
+
+    await announce(
+      interaction.channel,
+      interaction.user,
+      `manually set **${boss.name}** kill time (local time)`,
+      `🕒 Kill: <t:${tsKill}:F> — 🔄 Respawn: <t:${tsRespawn}:F>`
+    );
+
+    return interaction.deferUpdate();
+  }
+
   // =====================
   // RESET — step 1: show dropdown
   // =====================
   if (interaction.isButton() && interaction.customId === "reset_all") {
-    log(interaction.user, `BUTTON: reset_all → opened reset selection menu`);
+    log(interaction.user, `Opened reset selection menu`);
 
     const menu = new StringSelectMenuBuilder()
       .setCustomId("reset_select")
@@ -707,7 +787,7 @@ const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"))
     if (value === "DELETE_ALL") {
       data.kills = {};
       save();
-      log(interaction.user, `MENU: reset_select → RESET ALL TIMERS`);
+      log(interaction.user, `RESET ALL TIMERS`);
 
       await announce(interaction.channel, interaction.user, "reset **ALL** timers ☠️");
 
@@ -720,7 +800,7 @@ const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"))
     spawnWarnings[value] = { warned5: false, warned20: false, windowCreated: false };
 
     save();
-    log(interaction.user, `MENU: reset_select → RESET ${boss.name}`);
+    log(interaction.user, `RESET timer for ${boss.name}`);
 
     await announce(interaction.channel, interaction.user, `reset timer for **${boss.name}**`);
 
@@ -732,7 +812,7 @@ const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"))
   // =====================
   if (interaction.isButton() && interaction.customId === "undo") {
     const ok = undo();
-    log(interaction.user, ok ? `BUTTON: undo → UNDO success` : `BUTTON: undo → UNDO FAIL (nothing to undo)`);
+    log(interaction.user, ok ? `UNDO success` : `UNDO failed — nothing to undo`);
 
     await announce(
       interaction.channel,
@@ -747,13 +827,13 @@ const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"))
   // LOGS
   // =====================
   if (interaction.isButton() && interaction.customId === "show_logs") {
-    log(interaction.user, `BUTTON: show_logs → viewed logs`);
+    log(interaction.user, `Viewed logs`);
 
     const recent = adminLogs.slice(0, 20);
 
     let description = "";
     for (const l of recent) {
-      description += `<t:${Math.floor(l.time / 1000)}:F> — **${l.user}** — \`${l.action}\`\n`;
+      description += `\`${toServerDateTimeStr(l.time)}\` — **${l.user}** — ${l.action}\n`;
     }
 
     if (!description) description = "No actions logged yet.";
@@ -767,4 +847,4 @@ const kill = parseServerTimeToDate(interaction.fields.getTextInputValue("time"))
   }
 });
 
-client.login(config.token);
+client.login(process.env.DISCORD_TOKEN);
