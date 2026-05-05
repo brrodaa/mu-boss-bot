@@ -14,7 +14,7 @@ const {
 } = require("discord.js");
 
 const fs = require("fs");
-client.login(process.env.TOKEN);
+const config = require("./config.json");
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
@@ -116,6 +116,96 @@ function load() {
 function save() {
   fs.writeFileSync("data.json.tmp", JSON.stringify(data, null, 2));
   fs.renameSync("data.json.tmp", "data.json");
+}
+
+// =====================
+// BACKUP
+// =====================
+const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const MAX_LOCAL_BACKUPS = 48; // keep last 48h of hourly backups
+
+function saveLocalBackup() {
+  if (!fs.existsSync("backups")) fs.mkdirSync("backups");
+
+  const now = new Date();
+  const stamp = now.toISOString().replace(/:/g, "-").replace("T", "_").slice(0, 16);
+  const filename = `backups/data.backup-${stamp}.json`;
+
+  fs.writeFileSync(filename, JSON.stringify(data, null, 2));
+
+  // Prune old backups beyond MAX_LOCAL_BACKUPS
+  const files = fs.readdirSync("backups")
+    .filter(f => f.startsWith("data.backup-") && f.endsWith(".json"))
+    .sort();
+
+  if (files.length > MAX_LOCAL_BACKUPS) {
+    const toDelete = files.slice(0, files.length - MAX_LOCAL_BACKUPS);
+    for (const f of toDelete) {
+      fs.unlinkSync(`backups/${f}`);
+    }
+  }
+
+  return filename;
+}
+
+async function sendDiscordBackup(channel) {
+  const now = Date.now();
+  const stamp = toServerDateTimeStr(now);
+
+  // Build a summary embed
+  const embed = new EmbedBuilder()
+    .setTitle("💾 Hourly Backup Snapshot")
+    .setColor(0x57f287)
+    .setFooter({ text: `Backup taken at ${stamp} (server time)` });
+
+  const lines = [];
+  for (const b of BOSSES) {
+    const e = data.kills[b.id];
+    if (!e) {
+      lines.push(`• **${b.name}**: No data`);
+    } else {
+      lines.push(
+        `• **${b.name}**: killed by ${e.lastKiller} — kill: ${toServerDateTimeStr(e.killTime)} — respawn: ${toServerDateTimeStr(e.respawnTime)}`
+      );
+    }
+  }
+
+  embed.setDescription(lines.join("\n") || "No timers recorded.");
+
+  // Attach raw JSON as a file for easy restore
+  const jsonBuffer = Buffer.from(JSON.stringify(data, null, 2), "utf8");
+  const attachment = {
+    attachment: jsonBuffer,
+    name: `backup-${new Date(now).toISOString().replace(/:/g, "-").slice(0, 16)}.json`
+  };
+
+  await channel.send({ embeds: [embed], files: [attachment] });
+}
+
+async function runBackup(channel) {
+  try {
+    const localFile = saveLocalBackup();
+    console.log(`[Backup] Local backup saved: ${localFile}`);
+    await sendDiscordBackup(channel);
+    console.log(`[Backup] Discord backup sent`);
+  } catch (err) {
+    console.error(`[Backup] Error during backup:`, err);
+  }
+}
+
+function startBackupLoop(channel) {
+  // Align first backup to the next full hour, then fire every hour
+  const now = new Date();
+  const msUntilNextHour =
+    BACKUP_INTERVAL_MS -
+    (now.getMinutes() * 60000 + now.getSeconds() * 1000 + now.getMilliseconds());
+
+  console.log(`[Backup] First backup in ${Math.round(msUntilNextHour / 60000)} minute(s), then every hour.`);
+
+  setTimeout(() => {
+    runBackup(channel);
+    setInterval(() => runBackup(channel), BACKUP_INTERVAL_MS);
+  }, msUntilNextHour);
 }
 
 // =====================
@@ -447,6 +537,7 @@ client.once(Events.ClientReady, async () => {
   });
 
   startLoop();
+  startBackupLoop(channel); // <-- hourly backup starts here
 });
 
 // =====================
@@ -847,4 +938,4 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(config.token);
