@@ -14,6 +14,27 @@ const {
 } = require("discord.js");
 
 const fs = require("fs");
+let imported = false;
+
+async function importTimers(channel) {
+  if (imported) return;
+
+  for (const b of BOSSES) {
+    const e = data.kills[b.id];
+    if (!e) continue;
+
+    // optional: rebuild internal warnings
+    spawnWarnings[b.id] = {
+      warned5: false,
+      warned20: false,
+      windowCreated: false
+    };
+  }
+
+  console.log("Timers imported into bot state");
+  imported = true;
+}
+
 
 
 const client = new Client({
@@ -526,9 +547,13 @@ function checkWarnings(channel) {
 // =====================
 client.once(Events.ClientReady, async () => {
   console.log("Bot online");
+
   load();
 
   const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+
+  // optional one-time import (only if you really need it)
+  await importTimers(channel);
 
   dashboardMessage = await channel.send({
     embeds: [buildEmbed()],
@@ -537,7 +562,7 @@ client.once(Events.ClientReady, async () => {
   });
 
   startLoop();
-  startBackupLoop(channel); // <-- hourly backup starts here
+  startBackupLoop(channel);
 });
 
 // =====================
