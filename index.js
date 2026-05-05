@@ -19,6 +19,23 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
+function parseLocalTimeToUTC(h, m) {
+  const now = new Date();
+
+  // treat input as LOCAL TIME OF USER (Romania/Warsaw/etc)
+  const local = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    h,
+    m,
+    0,
+    0
+  );
+
+  return local.getTime();
+}
+
 // =====================
 // SETTINGS
 // =====================
