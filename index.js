@@ -19,32 +19,15 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
-/* =====================
-   TIMEZONE FIX (ONLY CHANGE)
-===================== */
-function parseHHMMToTimestamp(h, m) {
-  const now = new Date();
-
-  return Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    h,
-    m,
-    0,
-    0
-  );
-}
-
-/* =====================
+// =====================
 // SETTINGS
-===================== */
+// =====================
 const TICK_RATE = 5000;
 const MAX_UNDO = 10;
 
-/* =====================
+// =====================
 // STATE
-===================== */
+// =====================
 let data = { kills: {} };
 let dashboardMessage = null;
 
@@ -53,17 +36,9 @@ let spawnWindowMessages = {};
 let adminLogs = [];
 let undoStack = [];
 
-/* =====================
-// DASHBOARD RE-PIN
-===================== */
-const REPIN_AFTER_INTERACTIONS = 3;
-const REPIN_AFTER_MS = 3 * 60 * 1000;
-let interactionCount = 0;
-let lastRepinTime = Date.now();
-
-/* =====================
+// =====================
 // BOSSES
-===================== */
+// =====================
 function buildBosses() {
   const bosses = [];
   for (let i = 1; i <= 3; i++) bosses.push({ id: `lorencia_${i}`, name: `Kharzul #${i}` });
@@ -75,9 +50,9 @@ function buildBosses() {
 
 const BOSSES = buildBosses();
 
-/* =====================
+// =====================
 // SAVE / LOAD
-===================== */
+// =====================
 function load() {
   if (fs.existsSync("data.json")) {
     data = JSON.parse(fs.readFileSync("data.json", "utf8"));
@@ -90,9 +65,9 @@ function save() {
   fs.renameSync("data.json.tmp", "data.json");
 }
 
-/* =====================
-// FORMAT
-===================== */
+// =====================
+// TIME FORMAT
+// =====================
 function format(ms) {
   if (ms <= 0) return "NOW";
   const m = Math.floor(ms / 60000);
@@ -101,97 +76,44 @@ function format(ms) {
   return h > 0 ? `${h}h ${r}m` : `${m}m`;
 }
 
-/* =====================
-// LOGGING
-===================== */
-function log(user, actionType) {
-  adminLogs.unshift({
-    user: user.username,
-    action: actionType,
-    time: Date.now()
-  });
-  if (adminLogs.length > 200) adminLogs.pop();
-}
-
-/* =====================
-// UNDO
-===================== */
-function snapshot() {
-  undoStack.push(JSON.parse(JSON.stringify(data)));
-  if (undoStack.length > MAX_UNDO) undoStack.shift();
-}
-
-function undo() {
-  if (undoStack.length === 0) return false;
-  data = undoStack.pop();
-  save();
-  return true;
-}
-
-/* =====================
-// ANNOUNCE
-===================== */
-async function announce(channel, user, action, extra = "") {
-  const ts = Math.floor(Date.now() / 1000);
-  const msg = await channel.send(
-    `📢 **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`
+// =====================
+// TIME PARSER (WARSAW SHARED TIME)
+// =====================
+function parseTime(h, m) {
+  const now = new Date();
+  const d = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    h,
+    m,
+    0,
+    0
   );
 
-  setTimeout(() => msg.delete().catch(() => {}), 30 * 60 * 1000);
+  if (d.getTime() > Date.now()) {
+    d.setDate(d.getDate() - 1);
+  }
+
+  return d.getTime();
 }
 
-/* =====================
-// SPAWN WINDOW
-===================== */
-async function createSpawnWindow(boss, id, channel, windowEnd) {
-  if (spawnWindowMessages[id]) return;
-
-  const msg = await channel.send({
-    embeds: [
-      new EmbedBuilder()
-        .setTitle(`⚠️ ${boss.name} MAY SPAWN`)
-        .setColor(0xffcc00)
-        .setDescription(`🔥 Boss: **${boss.name}**\n⏳ Live window started`)
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("window_kill_" + id)
-          .setLabel("💀 Killed")
-          .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-          .setCustomId("window_settime_" + id)
-          .setLabel("⏱️ Set Time")
-          .setStyle(ButtonStyle.Secondary)
-      )
-    ],
-    flags: MessageFlags.SuppressNotifications
-  });
-
-  spawnWindowMessages[id] = { msg, windowEnd, boss };
-}
-
-/* =====================
-// DASHBOARD
-===================== */
+// =====================
+// EMBED
+// =====================
 function buildEmbed() {
   const now = Date.now();
 
   const embed = new EmbedBuilder()
     .setTitle("🔥 LIVE MU TRACKER")
-    .setColor(0xffaa00)
-    .setFooter({ text: "Auto-updates every 5s" });
+    .setColor(0xffaa00);
 
-  const bosses = BOSSES.map(b => {
+  for (const b of BOSSES) {
     const e = data.kills[b.id];
 
     if (!e) {
-      return {
-        name: b.name,
-        timeLeft: 0,
-        text: "🟢 READY\n👤 None",
-        isBroken: false
-      };
+      embed.addFields({ name: b.name, value: "🟢 READY\n👤 None" });
+      continue;
     }
 
     const cooldown = e.respawnTime - now;
@@ -199,113 +121,174 @@ function buildEmbed() {
     const windowLeft = windowEnd - now;
 
     let text;
-    let isBroken = false;
 
     if (cooldown <= 0 && windowLeft > 0) {
       text = `🟢 WINDOW\n⏳ ${format(windowLeft)}\n👤 ${e.lastKiller}`;
-    } else if (windowLeft <= 0) {
-      text = `⚠️ Timer possibly wrong\n👤 ${e.lastKiller}`;
-      isBroken = true;
     } else {
-      const serverTime = new Date(e.respawnTime).toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit"
-      });
-
-      text =
-        `🔴 ${format(cooldown)}\n` +
-        `🕒 ServerTime: ${serverTime}\n` +
-        `👤 ${e.lastKiller}`;
+      text = `🔴 ${format(cooldown)}\n👤 ${e.lastKiller}`;
     }
 
-    return {
-      name: b.name,
-      timeLeft: Math.max(cooldown, windowLeft),
-      text,
-      isBroken
-    };
-  });
-
-  bosses.sort((a, b) => {
-    if (a.isBroken && !b.isBroken) return 1;
-    if (!a.isBroken && b.isBroken) return -1;
-    return a.timeLeft - b.timeLeft;
-  });
-
-  for (const b of bosses) {
-    embed.addFields({ name: `• ${b.name}`, value: b.text });
+    embed.addFields({ name: b.name, value: text });
   }
 
   return embed;
 }
 
-/* =====================
-// INTERACTIONS (ONLY TIME FIX PART CHANGED)
-===================== */
-client.on(Events.InteractionCreate, async interaction => {
-  if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
+// =====================
+// BUTTONS
+// =====================
+function buildButtons() {
+  const rows = [];
 
-  /* WINDOW SET TIME */
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("window_killtime_")) {
-    snapshot();
+  for (let i = 0; i < BOSSES.length; i += 5) {
+    const row = new ActionRowBuilder();
 
-    const id = interaction.customId.replace("window_killtime_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
+    BOSSES.slice(i, i + 5).forEach(b => {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId("kill_" + b.id)
+          .setLabel(b.name.slice(0, 20))
+          .setStyle(ButtonStyle.Primary)
+      );
+    });
 
-    const killTime = parseHHMMToTimestamp(h, m);
-    const kill = new Date(killTime);
-
-    const respawnTime = killTime + 7 * 60 * 60 * 1000;
-
-    data.kills[id] = {
-      killTime,
-      respawnTime,
-      lastKiller: interaction.user.username
-    };
-
-    save();
-    return interaction.deferUpdate();
+    rows.push(row);
   }
 
-  /* INSERT TIME */
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_")) {
-    snapshot();
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("insert_time").setLabel("📝 Insert").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("reset_all").setLabel("🧹 Reset").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("undo").setLabel("↩️ Undo").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("show_logs").setLabel("📜 Logs").setStyle(ButtonStyle.Secondary)
+    )
+  );
 
-    const id = interaction.customId.replace("killtime_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
+  return rows;
+}
 
-    const killTime = parseHHMMToTimestamp(h, m);
-    const kill = new Date(killTime);
-
-    const respawnTime = killTime + 7 * 60 * 60 * 1000;
-
-    data.kills[id] = {
-      killTime,
-      respawnTime,
-      lastKiller: interaction.user.username
-    };
-
-    save();
-    return interaction.deferUpdate();
+// =====================
+// DASHBOARD RELOAD
+// =====================
+async function repin(channel) {
+  if (dashboardMessage) {
+    await dashboardMessage.delete().catch(() => {});
   }
-});
 
-/* =====================
-// START
-===================== */
+  dashboardMessage = await channel.send({
+    embeds: [buildEmbed()],
+    components: buildButtons(),
+    flags: MessageFlags.SuppressNotifications
+  });
+}
+
+// =====================
+// READY
+// =====================
 client.once(Events.ClientReady, async () => {
   console.log("Bot online");
   load();
 
   const channel = await client.channels.fetch(process.env.CHANNEL_ID);
 
-  dashboardMessage = await channel.send({
-    embeds: [buildEmbed()],
-    components: [],
-    flags: MessageFlags.SuppressNotifications
-  });
+  await repin(channel);
 });
 
+// =====================
+// INTERACTIONS
+// =====================
+client.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isButton() && !interaction.isModalSubmit()) return;
+
+  // =====================
+  // KILL BUTTON
+  // =====================
+  if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
+    const id = interaction.customId.replace("kill_", "");
+    const boss = BOSSES.find(b => b.id === id);
+
+    const now = Date.now();
+    const respawn = now + 7 * 60 * 60 * 1000;
+
+    data.kills[id] = {
+      killTime: now,
+      respawnTime: respawn,
+      lastKiller: interaction.user.username
+    };
+
+    save();
+
+    return interaction.deferUpdate();
+  }
+
+  // =====================
+  // INSERT MENU
+  // =====================
+  if (interaction.isButton() && interaction.customId === "insert_time") {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId("select_boss")
+      .setPlaceholder("Select boss")
+      .addOptions(BOSSES.map(b => ({ label: b.name, value: b.id })));
+
+    return interaction.reply({
+      components: [new ActionRowBuilder().addComponents(menu)],
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  // =====================
+  // SELECT BOSS
+  // =====================
+  if (interaction.isStringSelectMenu() && interaction.customId === "select_boss") {
+    const id = interaction.values[0];
+
+    const modal = new ModalBuilder()
+      .setCustomId("killtime_" + id)
+      .setTitle("Insert Time");
+
+    const input = new TextInputBuilder()
+      .setCustomId("time")
+      .setLabel("HH:MM")
+      .setStyle(TextInputStyle.Short);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+
+    return interaction.showModal(modal);
+  }
+
+  // =====================
+  // MODAL SUBMIT
+  // =====================
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_")) {
+    const id = interaction.customId.replace("killtime_", "");
+    const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
+
+    const kill = parseTime(h, m);
+    const respawn = kill + 7 * 60 * 60 * 1000;
+
+    data.kills[id] = {
+      killTime: kill,
+      respawnTime: respawn,
+      lastKiller: interaction.user.username
+    };
+
+    save();
+
+    return interaction.deferUpdate();
+  }
+});
+
+// =====================
+// LOOP
+// =====================
+setInterval(async () => {
+  if (!dashboardMessage) return;
+
+  await dashboardMessage.edit({
+    embeds: [buildEmbed()],
+    components: buildButtons()
+  });
+}, TICK_RATE);
+
+// =====================
 client.login(process.env.TOKEN);
