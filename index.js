@@ -14,28 +14,23 @@ const {
 } = require("discord.js");
 
 const fs = require("fs");
-let imported = false;
 
-async function importTimers(channel) {
-  if (imported) return;
+// =====================
+// CONFIG (from environment variables)
+// Set BOT_TOKEN and CHANNEL_ID in Railway / your host's env settings.
+// Never commit these values to GitHub.
+// =====================
+const TOKEN          = process.env.BOT_TOKEN;
+const CHANNEL_ID     = process.env.CHANNEL_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // private log channel — optional
 
-  for (const b of BOSSES) {
-    const e = data.kills[b.id];
-    if (!e) continue;
-
-    // optional: rebuild internal warnings
-    spawnWarnings[b.id] = {
-      warned5: false,
-      warned20: false,
-      windowCreated: false
-    };
-  }
-
-  console.log("Timers imported into bot state");
-  imported = true;
+if (!TOKEN || !CHANNEL_ID) {
+  console.error("ERROR: Missing BOT_TOKEN or CHANNEL_ID environment variables.");
+  process.exit(1);
 }
-
-
+if (!LOG_CHANNEL_ID) {
+  console.warn("[Warn] LOG_CHANNEL_ID not set — kill/action logs will not be forwarded to a private channel.");
+}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
@@ -45,7 +40,7 @@ const client = new Client({
 // SETTINGS
 // =====================
 const TICK_RATE = 5000;
-const MAX_UNDO = 10;
+const MAX_UNDO  = 10;
 
 // =====================
 // STATE
@@ -53,15 +48,25 @@ const MAX_UNDO = 10;
 let data = { kills: {} };
 let dashboardMessage = null;
 
-let spawnWarnings = {};
+let spawnWarnings       = {};
 let spawnWindowMessages = {};
-let adminLogs = [];
-let undoStack = [];
+let adminLogs  = [];
+let undoStack  = [];
+
+// Persistent Discord messages — posted once on startup, edited forever.
+// Channel order from bottom (newest) to top (oldest):
+//   [dashboard]   <- always at the very bottom, reposted when needed
+//   [backup 1-7]  <- static slots, just edited each hour (round-robin)
+//   [log]         <- oldest / highest up, edited on every action
+const MAX_DISCORD_BACKUPS = 7;
+let backupMessages  = [];  // Message objects, index 0 = slot 1
+let backupSlotIndex = 0;   // round-robin pointer
+let logMessage      = null;
 
 const REPIN_AFTER_INTERACTIONS = 3;
 const REPIN_AFTER_MS = 3 * 60 * 1000;
 let interactionCount = 0;
-let lastRepinTime = Date.now();
+let lastRepinTime    = Date.now();
 
 // =====================
 // BOSSES
@@ -69,8 +74,8 @@ let lastRepinTime = Date.now();
 function buildBosses() {
   const bosses = [];
   for (let i = 1; i <= 3; i++) bosses.push({ id: `lorencia_${i}`, name: `Kharzul #${i}` });
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `davias_${i}`, name: `Vescrya #${i}` });
-  for (let i = 1; i <= 2; i++) bosses.push({ id: `crywolf_${i}`, name: `Muggron #${i} Crywolf` });
+  for (let i = 1; i <= 3; i++) bosses.push({ id: `davias_${i}`,   name: `Vescrya #${i}` });
+  for (let i = 1; i <= 2; i++) bosses.push({ id: `crywolf_${i}`,  name: `Muggron #${i} Crywolf` });
   for (let i = 1; i <= 2; i++) bosses.push({ id: `barracks_${i}`, name: `Muggron #${i} Barracks` });
   return bosses;
 }
@@ -89,38 +94,28 @@ function getAmsterdamOffsetMs(date) {
 }
 
 function parseServerTime(h, m) {
-  const now = new Date();
+  const now     = new Date();
   const dateStr = now.toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
   const candidate = new Date(`${dateStr}T${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`);
-  const tzOffset = getAmsterdamOffsetMs(candidate);
-  const utcMs = candidate.getTime() - tzOffset;
-  const kill = new Date(utcMs);
+  const tzOffset  = getAmsterdamOffsetMs(candidate);
+  const utcMs     = candidate.getTime() - tzOffset;
+  const kill      = new Date(utcMs);
   if (kill > now) kill.setDate(kill.getDate() - 1);
   return kill;
 }
 
-// Format a UTC timestamp as HH:MM in server timezone (24h)
 function toServerTimeStr(ms) {
   return new Date(ms).toLocaleTimeString("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: SERVER_TZ,
-    hour12: false
+    hour: "2-digit", minute: "2-digit",
+    timeZone: SERVER_TZ, hour12: false
   });
 }
 
-// Format a UTC timestamp as HH:MM:SS DD/MM/YYYY in server timezone (24h) — for logs
 function toServerDateTimeStr(ms) {
-  const d = new Date(ms);
-  return d.toLocaleString("en-GB", {
-    timeZone: SERVER_TZ,
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric"
+  return new Date(ms).toLocaleString("en-GB", {
+    timeZone: SERVER_TZ, hour12: false,
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    day: "2-digit", month: "2-digit", year: "numeric"
   });
 }
 
@@ -140,28 +135,24 @@ function save() {
 }
 
 // =====================
-// BACKUP
+// BACKUP — local files
 // =====================
 const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-const MAX_LOCAL_BACKUPS = 48; // keep last 48h of hourly backups
+const MAX_LOCAL_BACKUPS  = 48;              // keep 2 days of hourly files
 
 function saveLocalBackup() {
   if (!fs.existsSync("backups")) fs.mkdirSync("backups");
 
-  const now = new Date();
+  const now   = new Date();
   const stamp = now.toISOString().replace(/:/g, "-").replace("T", "_").slice(0, 16);
   const filename = `backups/data.backup-${stamp}.json`;
-
   fs.writeFileSync(filename, JSON.stringify(data, null, 2));
 
-  // Prune old backups beyond MAX_LOCAL_BACKUPS
   const files = fs.readdirSync("backups")
     .filter(f => f.startsWith("data.backup-") && f.endsWith(".json"))
     .sort();
-
   if (files.length > MAX_LOCAL_BACKUPS) {
-    const toDelete = files.slice(0, files.length - MAX_LOCAL_BACKUPS);
-    for (const f of toDelete) {
+    for (const f of files.slice(0, files.length - MAX_LOCAL_BACKUPS)) {
       fs.unlinkSync(`backups/${f}`);
     }
   }
@@ -169,53 +160,75 @@ function saveLocalBackup() {
   return filename;
 }
 
-async function sendDiscordBackup(channel) {
-  const now = Date.now();
-  const stamp = toServerDateTimeStr(now);
+// =====================
+// BACKUP — Discord persistent slots
+// =====================
+function buildBackupEmbed(slotNumber, takenAt) {
+  const stamp = toServerDateTimeStr(takenAt || Date.now());
 
-  // Build a summary embed
-  const embed = new EmbedBuilder()
-    .setTitle("💾 Hourly Backup Snapshot")
-    .setColor(0x57f287)
-    .setFooter({ text: `Backup taken at ${stamp} (server time)` });
-
-  const lines = [];
-  for (const b of BOSSES) {
+  const lines = BOSSES.map(b => {
     const e = data.kills[b.id];
-    if (!e) {
-      lines.push(`• **${b.name}**: No data`);
-    } else {
-      lines.push(
-        `• **${b.name}**: killed by ${e.lastKiller} — kill: ${toServerDateTimeStr(e.killTime)} — respawn: ${toServerDateTimeStr(e.respawnTime)}`
-      );
-    }
-  }
+    if (!e) return `• **${b.name}**: —`;
+    return `• **${b.name}**: by ${e.lastKiller} — kill: ${toServerDateTimeStr(e.killTime)} — respawn: ${toServerDateTimeStr(e.respawnTime)}`;
+  });
 
-  embed.setDescription(lines.join("\n") || "No timers recorded.");
-
-  // Attach raw JSON as a file for easy restore
-  const jsonBuffer = Buffer.from(JSON.stringify(data, null, 2), "utf8");
-  const attachment = {
-    attachment: jsonBuffer,
-    name: `backup-${new Date(now).toISOString().replace(/:/g, "-").slice(0, 16)}.json`
-  };
-
-  await channel.send({ embeds: [embed], files: [attachment] });
+  return new EmbedBuilder()
+    .setTitle(`💾 Backup Slot ${slotNumber} / ${MAX_DISCORD_BACKUPS}`)
+    .setColor(0x2b2d31)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `Last updated: ${stamp} (server time)` });
 }
 
-async function runBackup(channel) {
+// Post all 7 slots once — called during startup, before the dashboard.
+async function initBackupMessages(channel) {
+  backupMessages  = [];
+  backupSlotIndex = 0;
+  for (let i = 1; i <= MAX_DISCORD_BACKUPS; i++) {
+    const msg = await channel.send({
+      embeds: [buildBackupEmbed(i, null)],
+      flags: MessageFlags.SuppressNotifications
+    });
+    backupMessages.push(msg);
+  }
+  console.log(`[Backup] ${MAX_DISCORD_BACKUPS} backup slots initialised.`);
+}
+
+// Edit the next slot in round-robin order — no new posts, no notifications.
+async function updateDiscordBackupSlot() {
+  if (backupMessages.length === 0) return;
+  const slot       = backupSlotIndex % MAX_DISCORD_BACKUPS;
+  const slotNumber = slot + 1;
+  const now        = Date.now();
+  const isoStamp   = new Date(now).toISOString().replace(/:/g, "-").slice(0, 16);
+
+  try {
+    await backupMessages[slot].edit({
+      embeds: [buildBackupEmbed(slotNumber, now)],
+      files: [{
+        attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"),
+        name: `backup-slot${slotNumber}-${isoStamp}.json`
+      }]
+    });
+    console.log(`[Backup] Discord slot ${slotNumber} updated.`);
+  } catch (err) {
+    console.error(`[Backup] Failed to edit slot ${slotNumber}:`, err);
+  }
+
+  backupSlotIndex = (backupSlotIndex + 1) % MAX_DISCORD_BACKUPS;
+}
+
+async function runBackup() {
   try {
     const localFile = saveLocalBackup();
     console.log(`[Backup] Local backup saved: ${localFile}`);
-    await sendDiscordBackup(channel);
-    console.log(`[Backup] Discord backup sent`);
+    await updateDiscordBackupSlot();
   } catch (err) {
     console.error(`[Backup] Error during backup:`, err);
   }
 }
 
-function startBackupLoop(channel) {
-  // Align first backup to the next full hour, then fire every hour
+// Aligns first run to the next full clock hour, then runs every hour.
+function startBackupLoop() {
   const now = new Date();
   const msUntilNextHour =
     BACKUP_INTERVAL_MS -
@@ -224,9 +237,44 @@ function startBackupLoop(channel) {
   console.log(`[Backup] First backup in ${Math.round(msUntilNextHour / 60000)} minute(s), then every hour.`);
 
   setTimeout(() => {
-    runBackup(channel);
-    setInterval(() => runBackup(channel), BACKUP_INTERVAL_MS);
+    runBackup();
+    setInterval(() => runBackup(), BACKUP_INTERVAL_MS);
   }, msUntilNextHour);
+}
+
+// =====================
+// PERSISTENT LOG MESSAGE
+// =====================
+function buildLogEmbed() {
+  const recent = adminLogs.slice(0, 20);
+  const description = recent.length
+    ? recent.map(l => `\`${toServerDateTimeStr(l.time)}\` — **${l.user}** — ${l.action}`).join("\n")
+    : "No actions logged yet.";
+
+  return new EmbedBuilder()
+    .setTitle("📜 Action Log (Last 20)")
+    .setDescription(description)
+    .setColor(0x5865f2)
+    .setFooter({ text: "Auto-updates on every action" });
+}
+
+// Post log message once — called first in startup so it sits highest in channel.
+async function initLogMessage(channel) {
+  logMessage = await channel.send({
+    embeds: [buildLogEmbed()],
+    flags: MessageFlags.SuppressNotifications
+  });
+  console.log("[Log] Persistent log message posted.");
+}
+
+// Silently edit the log message in-place.
+async function updateLogMessage() {
+  if (!logMessage) return;
+  try {
+    await logMessage.edit({ embeds: [buildLogEmbed()] });
+  } catch (err) {
+    console.error("[Log] Failed to update log message:", err);
+  }
 }
 
 // =====================
@@ -244,12 +292,9 @@ function format(ms) {
 // LOGGING
 // =====================
 function log(user, actionType) {
-  adminLogs.unshift({
-    user: user.username,
-    action: actionType,
-    time: Date.now()
-  });
+  adminLogs.unshift({ user: user.username, action: actionType, time: Date.now() });
   if (adminLogs.length > 200) adminLogs.pop();
+  updateLogMessage(); // keep the persistent message current
 }
 
 // =====================
@@ -268,14 +313,39 @@ function undo() {
 }
 
 // =====================
-// PUBLIC ANNOUNCE HELPER
+// ANNOUNCE HELPERS
 // =====================
-async function announce(channel, user, action, extra = "") {
-  const ts = Math.floor(Date.now() / 1000);
-  const msg = await channel.send(
-    `📢 **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`
-  );
-  setTimeout(() => msg.delete().catch(() => {}), 30 * 60 * 1000);
+
+// Kill record — stays in public channel permanently.
+// Also forwarded immediately to the private log channel.
+async function announceKill(channel, user, action, extra = "") {
+  const ts      = Math.floor(Date.now() / 1000);
+  const content = `⚔️ **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`;
+  await channel.send({ content, flags: 4096 });
+  forwardToLogChannel(content);
+}
+
+// Admin action (reset, undo) — shown publicly for 10 min, then deleted.
+// Also forwarded to the private log channel before deletion.
+async function announceAdmin(channel, user, action, extra = "") {
+  const ts      = Math.floor(Date.now() / 1000);
+  const content = `📢 **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`;
+  const msg     = await channel.send({ content, flags: 4096 });
+  setTimeout(() => {
+    forwardToLogChannel(content);
+    msg.delete().catch(() => {});
+  }, 10 * 60 * 1000);
+}
+
+// Forward a message to the private log channel (fire-and-forget).
+async function forwardToLogChannel(content) {
+  if (!LOG_CHANNEL_ID) return;
+  try {
+    const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
+    await logCh.send({ content, flags: 4096 });
+  } catch (err) {
+    console.error("[Log Channel] Failed to forward message:", err);
+  }
 }
 
 // =====================
@@ -308,8 +378,7 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
 
   spawnWindowMessages[id] = { msg, windowEnd, boss };
 
-  const msUntilExpiry = windowEnd - Date.now();
-  const deleteAfter = msUntilExpiry + 15 * 60 * 1000;
+  const deleteAfter = (windowEnd - Date.now()) + 15 * 60 * 1000;
   setTimeout(() => {
     msg.delete().catch(() => {});
     delete spawnWindowMessages[id];
@@ -332,8 +401,7 @@ async function recreateActiveSpawnWindows(channel) {
 // DASHBOARD EMBED
 // =====================
 function buildEmbed() {
-  const now = Date.now();
-
+  const now   = Date.now();
   const embed = new EmbedBuilder()
     .setTitle("🔥 LIVE MU TRACKER")
     .setColor(0xffaa00)
@@ -341,22 +409,12 @@ function buildEmbed() {
 
   const bosses = BOSSES.map(b => {
     const e = data.kills[b.id];
+    if (!e) return { name: b.name, timeLeft: 0, text: "🟢 READY\n👤 None", isBroken: false };
 
-    if (!e) {
-      return {
-        name: b.name,
-        timeLeft: 0,
-        text: "🟢 READY\n👤 None",
-        isBroken: false
-      };
-    }
-
-    const cooldown = e.respawnTime - now;
-    const windowEnd = e.respawnTime + 60 * 60 * 1000;
+    const cooldown   = e.respawnTime - now;
+    const windowEnd  = e.respawnTime + 60 * 60 * 1000;
     const windowLeft = windowEnd - now;
-
-    let text;
-    let isBroken = false;
+    let text, isBroken = false;
 
     if (cooldown <= 0 && windowLeft > 0) {
       text = `🟢 WINDOW\n⏳ ${format(windowLeft)}\n👤 ${e.lastKiller}`;
@@ -365,7 +423,7 @@ function buildEmbed() {
       text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${lastKnown}\n👤 ${e.lastKiller}`;
       isBroken = true;
     } else {
-      const tsRespawn = Math.floor(e.respawnTime / 1000);
+      const tsRespawn  = Math.floor(e.respawnTime / 1000);
       const serverTime = toServerTimeStr(e.respawnTime);
       text =
         `🔴 ${format(cooldown)}\n` +
@@ -373,12 +431,7 @@ function buildEmbed() {
         `👤 ${e.lastKiller}`;
     }
 
-    return {
-      name: b.name,
-      timeLeft: Math.max(cooldown, windowLeft),
-      text,
-      isBroken
-    };
+    return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
   });
 
   bosses.sort((a, b) => {
@@ -435,9 +488,7 @@ function buildButtons() {
 // REPIN DASHBOARD
 // =====================
 async function repinDashboard(channel) {
-  try {
-    if (dashboardMessage) await dashboardMessage.delete().catch(() => {});
-  } catch (_) {}
+  if (dashboardMessage) await dashboardMessage.delete().catch(() => {});
 
   dashboardMessage = await channel.send({
     embeds: [buildEmbed()],
@@ -446,7 +497,7 @@ async function repinDashboard(channel) {
   });
 
   interactionCount = 0;
-  lastRepinTime = Date.now();
+  lastRepinTime    = Date.now();
 
   await recreateActiveSpawnWindows(channel);
 }
@@ -480,12 +531,10 @@ function startLoop() {
     }
 
     const now = Date.now();
-
     for (const id in spawnWindowMessages) {
-      const w = spawnWindowMessages[id];
+      const w         = spawnWindowMessages[id];
       const remaining = w.windowEnd - now;
       if (remaining <= 0) continue;
-
       w.msg.edit({
         embeds: [
           new EmbedBuilder()
@@ -510,8 +559,8 @@ function checkWarnings(channel) {
     const e = data.kills[b.id];
     if (!e) continue;
 
-    const cooldown = e.respawnTime - now;
-    const windowEnd = e.respawnTime + 60 * 60 * 1000;
+    const cooldown   = e.respawnTime - now;
+    const windowEnd  = e.respawnTime + 60 * 60 * 1000;
     const windowLeft = windowEnd - now;
 
     if (!spawnWarnings[b.id]) {
@@ -525,12 +574,7 @@ function checkWarnings(channel) {
       channel.send(`@everyone ⏳ **${b.name}** spawns in 5 minutes`);
     }
 
-    if (
-      cooldown <= 0 &&
-      windowLeft > 2 * 60 * 1000 &&
-      windowLeft <= 20 * 60 * 1000 &&
-      !w.warned20
-    ) {
+    if (cooldown <= 0 && windowLeft > 2 * 60 * 1000 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
       w.warned20 = true;
       channel.send(`@everyone ⚠️ **${b.name}** may spawn in 20 minutes`);
     }
@@ -544,17 +588,20 @@ function checkWarnings(channel) {
 
 // =====================
 // READY
+//
+// Post order determines channel position (newer = lower).
+// We want, scrolling DOWN:  [log] -> [backup 1..7] -> [dashboard]
+// So we post in this order: log first, then backups, then dashboard last.
 // =====================
 client.once(Events.ClientReady, async () => {
   console.log("Bot online");
-
   load();
 
-  const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+  const channel = await client.channels.fetch(CHANNEL_ID);
 
-  // optional one-time import (only if you really need it)
-  await importTimers(channel);
-
+  await initLogMessage(channel);     // 1. posted first  -> sits highest
+  await initBackupMessages(channel); // 2. posted second -> sits in middle
+                                      // 3. dashboard posted last -> sits at bottom
   dashboardMessage = await channel.send({
     embeds: [buildEmbed()],
     components: buildButtons(),
@@ -562,7 +609,7 @@ client.once(Events.ClientReady, async () => {
   });
 
   startLoop();
-  startBackupLoop(channel);
+  startBackupLoop();
 });
 
 // =====================
@@ -582,30 +629,20 @@ client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
     snapshot();
 
-    const id = interaction.customId.replace("kill_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const now = Date.now();
+    const id          = interaction.customId.replace("kill_", "");
+    const boss        = BOSSES.find(b => b.id === id);
+    const now         = Date.now();
     const respawnTime = now + 7 * 60 * 60 * 1000;
 
-    data.kills[id] = {
-      killTime: now,
-      respawnTime,
-      lastKiller: interaction.user.username
-    };
-
+    data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `KILLED ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
-
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
-    const tsKill = Math.floor(now / 1000);
-    const tsRespawn = Math.floor(respawnTime / 1000);
-
-    await announce(
-      interaction.channel,
-      interaction.user,
+    await announceKill(
+      interaction.channel, interaction.user,
       `killed **${boss.name}**`,
-      `🕒 Kill: <t:${tsKill}:F> — 🔄 Respawn: <t:${tsRespawn}:F>`
+      `🕒 Kill: <t:${Math.floor(now / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
     );
 
     return interaction.deferUpdate();
@@ -617,9 +654,9 @@ client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isButton() && interaction.customId.startsWith("window_kill_")) {
     snapshot();
 
-    const id = interaction.customId.replace("window_kill_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const now = Date.now();
+    const id          = interaction.customId.replace("window_kill_", "");
+    const boss        = BOSSES.find(b => b.id === id);
+    const now         = Date.now();
     const respawnTime = now + 7 * 60 * 60 * 1000;
 
     if (spawnWindowMessages[id]) {
@@ -627,25 +664,15 @@ client.on(Events.InteractionCreate, async interaction => {
       delete spawnWindowMessages[id];
     }
 
-    data.kills[id] = {
-      killTime: now,
-      respawnTime,
-      lastKiller: interaction.user.username
-    };
-
+    data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `WINDOW KILL ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
-
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
-    const tsKill = Math.floor(now / 1000);
-    const tsRespawn = Math.floor(respawnTime / 1000);
-
-    await announce(
-      interaction.channel,
-      interaction.user,
+    await announceKill(
+      interaction.channel, interaction.user,
       `killed **${boss.name}** (window kill)`,
-      `🕒 Kill: <t:${tsKill}:F> — 🔄 Respawn: <t:${tsRespawn}:F>`
+      `🕒 Kill: <t:${Math.floor(now / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
     );
 
     return interaction.deferUpdate();
@@ -655,7 +682,7 @@ client.on(Events.InteractionCreate, async interaction => {
   // WINDOW SET TIME — show modal
   // =====================
   if (interaction.isButton() && interaction.customId.startsWith("window_settime_")) {
-    const id = interaction.customId.replace("window_settime_", "");
+    const id   = interaction.customId.replace("window_settime_", "");
     const boss = BOSSES.find(b => b.id === id);
 
     log(interaction.user, `Opened set-time modal for ${boss.name} (window)`);
@@ -663,13 +690,9 @@ client.on(Events.InteractionCreate, async interaction => {
     const modal = new ModalBuilder()
       .setCustomId("window_killtime_" + id)
       .setTitle(`Set Kill Time — ${boss.name}`);
-
-    const input = new TextInputBuilder()
-      .setCustomId("time")
-      .setLabel("HH:MM (24h, server time)")
-      .setStyle(TextInputStyle.Short);
-
-    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId("time").setLabel("HH:MM (24h, server time)").setStyle(TextInputStyle.Short)
+    ));
 
     return interaction.showModal(modal);
   }
@@ -678,12 +701,10 @@ client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isModalSubmit() && interaction.customId.startsWith("window_killtime_")) {
     snapshot();
 
-    const id = interaction.customId.replace("window_killtime_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const timeValue = interaction.fields.getTextInputValue("time");
-    const [h, m] = timeValue.split(":").map(Number);
-
-    const kill = parseServerTime(h, m);
+    const id          = interaction.customId.replace("window_killtime_", "");
+    const boss        = BOSSES.find(b => b.id === id);
+    const [h, m]      = interaction.fields.getTextInputValue("time").split(":").map(Number);
+    const kill        = parseServerTime(h, m);
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
     if (spawnWindowMessages[id]) {
@@ -691,25 +712,15 @@ client.on(Events.InteractionCreate, async interaction => {
       delete spawnWindowMessages[id];
     }
 
-    data.kills[id] = {
-      killTime: kill.getTime(),
-      respawnTime,
-      lastKiller: interaction.user.username
-    };
-
+    data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `MANUAL SET (window) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
-
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
-    const tsKill = Math.floor(kill.getTime() / 1000);
-    const tsRespawn = Math.floor(respawnTime / 1000);
-
-    await announce(
-      interaction.channel,
-      interaction.user,
+    await announceKill(
+      interaction.channel, interaction.user,
       `manually set **${boss.name}** kill time (from window)`,
-      `🕒 Kill: <t:${tsKill}:F> — 🔄 Respawn: <t:${tsRespawn}:F>`
+      `🕒 Kill: <t:${Math.floor(kill.getTime() / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
     );
 
     return interaction.deferUpdate();
@@ -735,7 +746,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // INSERT TIME — step 2: pick timezone mode
   if (interaction.isStringSelectMenu() && interaction.customId === "select_boss_insert") {
-    const id = interaction.values[0];
+    const id   = interaction.values[0];
     const boss = BOSSES.find(b => b.id === id);
 
     log(interaction.user, `Insert: selected boss ${boss.name}, showing timezone choice`);
@@ -744,16 +755,8 @@ client.on(Events.InteractionCreate, async interaction => {
       .setCustomId("select_tzmode_" + id)
       .setPlaceholder("Which time format will you enter?")
       .addOptions([
-        {
-          label: "🌍 Server time (HH:MM, 24h)",
-          description: "Enter the kill time in server timezone",
-          value: "server"
-        },
-        {
-          label: "🏠 My local time (HH:MM, 24h)",
-          description: "Enter the kill time in your own timezone",
-          value: "local"
-        }
+        { label: "🌍 Server time (HH:MM, 24h)", description: "Enter the kill time in server timezone", value: "server" },
+        { label: "🏠 My local time (HH:MM, 24h)", description: "Enter the kill time in your own timezone", value: "local" }
       ]);
 
     return interaction.reply({
@@ -763,112 +766,81 @@ client.on(Events.InteractionCreate, async interaction => {
     });
   }
 
-  // INSERT TIME — step 3: show modal based on chosen mode
+  // INSERT TIME — step 3: show modal
   if (interaction.isStringSelectMenu() && interaction.customId.startsWith("select_tzmode_")) {
-    const id = interaction.customId.replace("select_tzmode_", "");
+    const id   = interaction.customId.replace("select_tzmode_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const mode = interaction.values[0]; // "server" or "local"
+    const mode = interaction.values[0];
 
     log(interaction.user, `Insert: ${boss.name} — chose ${mode} time input`);
-
-    const label = mode === "server"
-      ? "HH:MM (24h, server time)"
-      : "HH:MM (24h, your local time)";
 
     const modal = new ModalBuilder()
       .setCustomId(`killtime_${mode}_${id}`)
       .setTitle(`Insert Kill Time — ${boss.name}`);
-
-    const input = new TextInputBuilder()
-      .setCustomId("time")
-      .setLabel(label)
-      .setStyle(TextInputStyle.Short);
-
-    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("time")
+        .setLabel(mode === "server" ? "HH:MM (24h, server time)" : "HH:MM (24h, your local time)")
+        .setStyle(TextInputStyle.Short)
+    ));
 
     return interaction.showModal(modal);
   }
 
-  // INSERT TIME — step 4: save (server time mode)
+  // INSERT TIME — step 4a: save (server time)
   if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_server_")) {
     snapshot();
 
-    const id = interaction.customId.replace("killtime_server_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const timeValue = interaction.fields.getTextInputValue("time");
-    const [h, m] = timeValue.split(":").map(Number);
-
-    const kill = parseServerTime(h, m);
+    const id          = interaction.customId.replace("killtime_server_", "");
+    const boss        = BOSSES.find(b => b.id === id);
+    const [h, m]      = interaction.fields.getTextInputValue("time").split(":").map(Number);
+    const kill        = parseServerTime(h, m);
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
-    data.kills[id] = {
-      killTime: kill.getTime(),
-      respawnTime,
-      lastKiller: interaction.user.username
-    };
-
+    data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `MANUAL SET (server time) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
-
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
-    const tsKill = Math.floor(kill.getTime() / 1000);
-    const tsRespawn = Math.floor(respawnTime / 1000);
-
-    await announce(
-      interaction.channel,
-      interaction.user,
+    await announceKill(
+      interaction.channel, interaction.user,
       `manually set **${boss.name}** kill time`,
-      `🕒 Kill: <t:${tsKill}:F> — 🔄 Respawn: <t:${tsRespawn}:F>`
+      `🕒 Kill: <t:${Math.floor(kill.getTime() / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
     );
 
     return interaction.deferUpdate();
   }
 
-  // INSERT TIME — step 4: save (local time mode)
+  // INSERT TIME — step 4b: save (local time)
   if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_local_")) {
     snapshot();
 
-    const id = interaction.customId.replace("killtime_local_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const timeValue = interaction.fields.getTextInputValue("time");
-    const [h, m] = timeValue.split(":").map(Number);
-
-    // Treat input as the bot host's local time (i.e. what the user typed as-is)
-    // Discord doesn't expose the user's timezone, so we parse it as local wall clock
-    const now = new Date();
-    const kill = new Date(now);
+    const id          = interaction.customId.replace("killtime_local_", "");
+    const boss        = BOSSES.find(b => b.id === id);
+    const [h, m]      = interaction.fields.getTextInputValue("time").split(":").map(Number);
+    const now         = new Date();
+    const kill        = new Date(now);
     kill.setHours(h, m, 0, 0);
     if (kill > now) kill.setDate(kill.getDate() - 1);
 
     const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
 
-    data.kills[id] = {
-      killTime: kill.getTime(),
-      respawnTime,
-      lastKiller: interaction.user.username
-    };
-
+    data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
-    log(interaction.user, `MANUAL SET (local time input) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
-
+    log(interaction.user, `MANUAL SET (local time) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
-    const tsKill = Math.floor(kill.getTime() / 1000);
-    const tsRespawn = Math.floor(respawnTime / 1000);
-
-    await announce(
-      interaction.channel,
-      interaction.user,
+    await announceKill(
+      interaction.channel, interaction.user,
       `manually set **${boss.name}** kill time (local time)`,
-      `🕒 Kill: <t:${tsKill}:F> — 🔄 Respawn: <t:${tsRespawn}:F>`
+      `🕒 Kill: <t:${Math.floor(kill.getTime() / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
     );
 
     return interaction.deferUpdate();
   }
 
   // =====================
-  // RESET — step 1: show dropdown
+  // RESET — step 1: dropdown
   // =====================
   if (interaction.isButton() && interaction.customId === "reset_all") {
     log(interaction.user, `Opened reset selection menu`);
@@ -877,14 +849,8 @@ client.on(Events.InteractionCreate, async interaction => {
       .setCustomId("reset_select")
       .setPlaceholder("Select what to reset")
       .addOptions([
-        ...BOSSES.map(b => ({
-          label: `Reset ${b.name}`,
-          value: b.id
-        })),
-        {
-          label: "☠️ DELETE ALL TIMERS (Server Reset)",
-          value: "DELETE_ALL"
-        }
+        ...BOSSES.map(b => ({ label: `Reset ${b.name}`, value: b.id })),
+        { label: "☠️ DELETE ALL TIMERS (Server Reset)", value: "DELETE_ALL" }
       ]);
 
     return interaction.reply({
@@ -904,22 +870,16 @@ client.on(Events.InteractionCreate, async interaction => {
       data.kills = {};
       save();
       log(interaction.user, `RESET ALL TIMERS`);
-
-      await announce(interaction.channel, interaction.user, "reset **ALL** timers ☠️");
-
+      await announceAdmin(interaction.channel, interaction.user, "reset **ALL** timers ☠️");
       return interaction.deferUpdate();
     }
 
     const boss = BOSSES.find(b => b.id === value);
     delete data.kills[value];
-
     spawnWarnings[value] = { warned5: false, warned20: false, windowCreated: false };
-
     save();
     log(interaction.user, `RESET timer for ${boss.name}`);
-
-    await announce(interaction.channel, interaction.user, `reset timer for **${boss.name}**`);
-
+    await announceAdmin(interaction.channel, interaction.user, `reset timer for **${boss.name}**`);
     return interaction.deferUpdate();
   }
 
@@ -930,9 +890,8 @@ client.on(Events.InteractionCreate, async interaction => {
     const ok = undo();
     log(interaction.user, ok ? `UNDO success` : `UNDO failed — nothing to undo`);
 
-    await announce(
-      interaction.channel,
-      interaction.user,
+    await announceAdmin(
+      interaction.channel, interaction.user,
       ok ? "used **Undo** ↩️" : "tried to undo — nothing to undo"
     );
 
@@ -940,27 +899,13 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 
   // =====================
-  // LOGS
+  // LOGS — ephemeral popup for quick reading;
+  // the persistent log message above stays updated automatically.
   // =====================
   if (interaction.isButton() && interaction.customId === "show_logs") {
     log(interaction.user, `Viewed logs`);
-
-    const recent = adminLogs.slice(0, 20);
-
-    let description = "";
-    for (const l of recent) {
-      description += `\`${toServerDateTimeStr(l.time)}\` — **${l.user}** — ${l.action}\n`;
-    }
-
-    if (!description) description = "No actions logged yet.";
-
-    const embed = new EmbedBuilder()
-      .setTitle("📜 Action Log (Last 20)")
-      .setDescription(description)
-      .setColor(0x5865f2);
-
-    return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    return interaction.reply({ embeds: [buildLogEmbed()], flags: MessageFlags.Ephemeral });
   }
 });
 
-client.login(process.env.TOKEN);
+client.login(TOKEN);
