@@ -13,16 +13,22 @@ const {
   TextInputStyle
 } = require("discord.js");
 
-const fs = require("fs");
+const fs   = require("fs");
+const path = require("path");
 
 // =====================
 // CONFIG (from environment variables)
-// Set BOT_TOKEN and CHANNEL_ID in Railway / your host's env settings.
-// Never commit these values to GitHub.
+// Set BOT_TOKEN, CHANNEL_ID, LOG_CHANNEL_ID, and DATA_BACKUP_CHANNEL_ID
+// in Railway / your host's env settings. Never commit these values to GitHub.
+//
+// DATA_BACKUP_CHANNEL_ID — the private "bot-logs" channel where the 7
+//   rotating backup slots are posted. The bot also reads this channel on
+//   startup to restore timers after a redeploy. Set to 1501499727877898311.
 // =====================
-const TOKEN          = process.env.BOT_TOKEN;
-const CHANNEL_ID     = process.env.CHANNEL_ID;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // private log channel — optional
+const TOKEN                  = process.env.BOT_TOKEN;
+const CHANNEL_ID             = process.env.CHANNEL_ID;
+const LOG_CHANNEL_ID         = process.env.LOG_CHANNEL_ID;
+const DATA_BACKUP_CHANNEL_ID = process.env.DATA_BACKUP_CHANNEL_ID; // bot-logs
 
 if (!TOKEN || !CHANNEL_ID) {
   console.error("ERROR: Missing BOT_TOKEN or CHANNEL_ID environment variables.");
@@ -30,6 +36,9 @@ if (!TOKEN || !CHANNEL_ID) {
 }
 if (!LOG_CHANNEL_ID) {
   console.warn("[Warn] LOG_CHANNEL_ID not set — kill/action logs will not be forwarded to a private channel.");
+}
+if (!DATA_BACKUP_CHANNEL_ID) {
+  console.warn("[Warn] DATA_BACKUP_CHANNEL_ID not set — timer backups will not be posted to bot-logs, and redeploy recovery is disabled.");
 }
 
 const client = new Client({
@@ -54,10 +63,11 @@ let adminLogs  = [];
 let undoStack  = [];
 
 // Persistent Discord messages — posted once on startup, edited forever.
-// Channel order from bottom (newest) to top (oldest):
+// In the DATA_BACKUP_CHANNEL (bot-logs):
+//   [backup 1-7]  <- static slots, edited each hour (round-robin)
+// In the public CHANNEL:
+//   [log]         <- action log, edited on every action
 //   [dashboard]   <- always at the very bottom, reposted when needed
-//   [backup 1-7]  <- static slots, just edited each hour (round-robin)
-//   [log]         <- oldest / highest up, edited on every action
 const MAX_DISCORD_BACKUPS = 7;
 let backupMessages  = [];  // Message objects, index 0 = slot 1
 let backupSlotIndex = 0;   // round-robin pointer
@@ -135,6 +145,66 @@ function save() {
 }
 
 // =====================
+// REDEPLOY RECOVERY
+// =====================
+// On startup, if data.json is missing or empty (fresh host after redeploy),
+// fetch the most recent backup message from the DATA_BACKUP_CHANNEL and
+// restore timer data from its attached JSON file.
+async function recoverFromDiscordBackup() {
+  if (!DATA_BACKUP_CHANNEL_ID) return false;
+
+  // Only recover if local data is missing or has no kills at all
+  const localEmpty = !fs.existsSync("data.json") ||
+    Object.keys(JSON.parse(fs.readFileSync("data.json", "utf8")).kills || {}).length === 0;
+
+  if (!localEmpty) {
+    console.log("[Recovery] Local data.json exists and has timers — skipping Discord recovery.");
+    return false;
+  }
+
+  console.log("[Recovery] No local timer data found. Attempting to restore from Discord backup channel...");
+
+  try {
+    const backupCh = await client.channels.fetch(DATA_BACKUP_CHANNEL_ID);
+
+    // Fetch recent messages from the backup channel (up to 50, plenty for 7 slots)
+    const messages = await backupCh.messages.fetch({ limit: 50 });
+
+    // Find the most recent message that has a JSON file attachment
+    const backupMsg = messages.find(m =>
+      m.author.id === client.user.id &&
+      m.attachments.size > 0 &&
+      [...m.attachments.values()].some(a => a.name && a.name.endsWith(".json"))
+    );
+
+    if (!backupMsg) {
+      console.warn("[Recovery] No backup messages with JSON attachments found in bot-logs channel.");
+      return false;
+    }
+
+    const attachment = [...backupMsg.attachments.values()].find(a => a.name && a.name.endsWith(".json"));
+
+    // Download the attachment
+    const response = await fetch(attachment.url);
+    if (!response.ok) throw new Error(`HTTP ${response.status} fetching attachment`);
+    const json = await response.json();
+
+    if (!json.kills) throw new Error("Attachment JSON has no 'kills' field");
+
+    data = json;
+    save();
+
+    const killCount = Object.keys(data.kills).length;
+    console.log(`[Recovery] ✅ Restored ${killCount} timer(s) from Discord backup: "${attachment.name}" (sent ${backupMsg.createdAt.toISOString()})`);
+
+    return true;
+  } catch (err) {
+    console.error("[Recovery] Failed to restore from Discord backup:", err);
+    return false;
+  }
+}
+
+// =====================
 // BACKUP — local files
 // =====================
 const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
@@ -161,7 +231,7 @@ function saveLocalBackup() {
 }
 
 // =====================
-// BACKUP — Discord persistent slots
+// BACKUP — Discord persistent slots (posted to DATA_BACKUP_CHANNEL / bot-logs)
 // =====================
 function buildBackupEmbed(slotNumber, takenAt) {
   const stamp = toServerDateTimeStr(takenAt || Date.now());
@@ -176,24 +246,31 @@ function buildBackupEmbed(slotNumber, takenAt) {
     .setTitle(`💾 Backup Slot ${slotNumber} / ${MAX_DISCORD_BACKUPS}`)
     .setColor(0x2b2d31)
     .setDescription(lines.join("\n"))
-    .setFooter({ text: `Last updated: ${stamp} (server time)` });
+    .setFooter({ text: `Last updated: ${stamp} (server time) — attach JSON used for redeploy recovery` });
 }
 
-// Post all 7 slots once — called during startup, before the dashboard.
-async function initBackupMessages(channel) {
+// Post all 7 slots once in the DATA_BACKUP_CHANNEL — called during startup.
+async function initBackupMessages(backupChannel) {
   backupMessages  = [];
   backupSlotIndex = 0;
   for (let i = 1; i <= MAX_DISCORD_BACKUPS; i++) {
-    const msg = await channel.send({
+    const now      = Date.now();
+    const isoStamp = new Date(now).toISOString().replace(/:/g, "-").slice(0, 16);
+    const msg = await backupChannel.send({
       embeds: [buildBackupEmbed(i, null)],
+      files: [{
+        attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"),
+        name: `backup-slot${i}-${isoStamp}.json`
+      }],
       flags: MessageFlags.SuppressNotifications
     });
     backupMessages.push(msg);
   }
-  console.log(`[Backup] ${MAX_DISCORD_BACKUPS} backup slots initialised.`);
+  console.log(`[Backup] ${MAX_DISCORD_BACKUPS} backup slots initialised in bot-logs channel.`);
 }
 
 // Edit the next slot in round-robin order — no new posts, no notifications.
+// Each edit includes the latest data as a JSON attachment for recovery.
 async function updateDiscordBackupSlot() {
   if (backupMessages.length === 0) return;
   const slot       = backupSlotIndex % MAX_DISCORD_BACKUPS;
@@ -209,7 +286,7 @@ async function updateDiscordBackupSlot() {
         name: `backup-slot${slotNumber}-${isoStamp}.json`
       }]
     });
-    console.log(`[Backup] Discord slot ${slotNumber} updated.`);
+    console.log(`[Backup] Discord slot ${slotNumber} updated in bot-logs.`);
   } catch (err) {
     console.error(`[Backup] Failed to edit slot ${slotNumber}:`, err);
   }
@@ -243,7 +320,7 @@ function startBackupLoop() {
 }
 
 // =====================
-// PERSISTENT LOG MESSAGE
+// PERSISTENT LOG MESSAGE (public channel)
 // =====================
 function buildLogEmbed() {
   const recent = adminLogs.slice(0, 20);
@@ -258,7 +335,6 @@ function buildLogEmbed() {
     .setFooter({ text: "Auto-updates on every action" });
 }
 
-// Post log message once — called first in startup so it sits highest in channel.
 async function initLogMessage(channel) {
   logMessage = await channel.send({
     embeds: [buildLogEmbed()],
@@ -267,7 +343,6 @@ async function initLogMessage(channel) {
   console.log("[Log] Persistent log message posted.");
 }
 
-// Silently edit the log message in-place.
 async function updateLogMessage() {
   if (!logMessage) return;
   try {
@@ -294,7 +369,7 @@ function format(ms) {
 function log(user, actionType) {
   adminLogs.unshift({ user: user.username, action: actionType, time: Date.now() });
   if (adminLogs.length > 200) adminLogs.pop();
-  updateLogMessage(); // keep the persistent message current
+  updateLogMessage();
 }
 
 // =====================
@@ -315,9 +390,6 @@ function undo() {
 // =====================
 // ANNOUNCE HELPERS
 // =====================
-
-// Kill record — stays in public channel permanently.
-// Also forwarded immediately to the private log channel.
 async function announceKill(channel, user, action, extra = "") {
   const ts      = Math.floor(Date.now() / 1000);
   const content = `⚔️ **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`;
@@ -325,8 +397,6 @@ async function announceKill(channel, user, action, extra = "") {
   forwardToLogChannel(content);
 }
 
-// Admin action (reset, undo) — shown publicly for 10 min, then deleted.
-// Also forwarded to the private log channel before deletion.
 async function announceAdmin(channel, user, action, extra = "") {
   const ts      = Math.floor(Date.now() / 1000);
   const content = `📢 **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`;
@@ -337,7 +407,6 @@ async function announceAdmin(channel, user, action, extra = "") {
   }, 10 * 60 * 1000);
 }
 
-// Forward a message to the private log channel (fire-and-forget).
 async function forwardToLogChannel(content) {
   if (!LOG_CHANNEL_ID) return;
   try {
@@ -589,19 +658,42 @@ function checkWarnings(channel) {
 // =====================
 // READY
 //
-// Post order determines channel position (newer = lower).
-// We want, scrolling DOWN:  [log] -> [backup 1..7] -> [dashboard]
-// So we post in this order: log first, then backups, then dashboard last.
+// Startup order:
+//   1. Load local data.json (if it exists)
+//   2. If local data is empty AND DATA_BACKUP_CHANNEL_ID is set,
+//      recover from the most recent Discord backup attachment
+//   3. Post log message in public channel (sits highest)
+//   4. Post/init 7 backup slots in bot-logs channel
+//   5. Post dashboard in public channel (sits lowest)
 // =====================
 client.once(Events.ClientReady, async () => {
   console.log("Bot online");
   load();
 
+  // Attempt recovery from Discord backup if local data is empty
+  const recovered = await recoverFromDiscordBackup();
+  if (recovered) {
+    console.log("[Recovery] Timer data restored from Discord backup — resuming normally.");
+  }
+
   const channel = await client.channels.fetch(CHANNEL_ID);
 
-  await initLogMessage(channel);     // 1. posted first  -> sits highest
-  await initBackupMessages(channel); // 2. posted second -> sits in middle
-                                      // 3. dashboard posted last -> sits at bottom
+  await initLogMessage(channel);     // 1. posted first → sits highest in public channel
+
+  // Init backup slots in bot-logs (or fall back to public channel if not configured)
+  if (DATA_BACKUP_CHANNEL_ID) {
+    try {
+      const backupCh = await client.channels.fetch(DATA_BACKUP_CHANNEL_ID);
+      await initBackupMessages(backupCh);
+    } catch (err) {
+      console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID, falling back to main channel:", err);
+      await initBackupMessages(channel);
+    }
+  } else {
+    await initBackupMessages(channel); // fallback: same channel as before
+  }
+
+  // Dashboard posted last → sits at bottom of public channel
   dashboardMessage = await channel.send({
     embeds: [buildEmbed()],
     components: buildButtons(),
@@ -899,8 +991,7 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 
   // =====================
-  // LOGS — ephemeral popup for quick reading;
-  // the persistent log message above stays updated automatically.
+  // LOGS
   // =====================
   if (interaction.isButton() && interaction.customId === "show_logs") {
     log(interaction.user, `Viewed logs`);
