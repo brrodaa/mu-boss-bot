@@ -391,15 +391,15 @@ function undo() {
 // ANNOUNCE HELPERS
 // =====================
 async function announceKill(channel, user, action, extra = "") {
-  const ts      = Math.floor(Date.now() / 1000);
-  const content = `⚔️ **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`;
+  const now     = Date.now();
+  const content = `⚔️ **${user.username}** ${action} — ${toServerDateTimeStr(now)} (server time)${extra ? `\n${extra}` : ""}`;
   await channel.send({ content, flags: 4096 });
   forwardToLogChannel(content);
 }
 
 async function announceAdmin(channel, user, action, extra = "") {
-  const ts      = Math.floor(Date.now() / 1000);
-  const content = `📢 **${user.username}** ${action} — <t:${ts}:F>${extra ? `\n${extra}` : ""}`;
+  const now     = Date.now();
+  const content = `📢 **${user.username}** ${action} — ${toServerDateTimeStr(now)} (server time)${extra ? `\n${extra}` : ""}`;
   const msg     = await channel.send({ content, flags: 4096 });
   setTimeout(() => {
     forwardToLogChannel(content);
@@ -486,17 +486,19 @@ function buildEmbed() {
     let text, isBroken = false;
 
     if (cooldown <= 0 && windowLeft > 0) {
-      text = `🟢 WINDOW\n⏳ ${format(windowLeft)}\n👤 ${e.lastKiller}`;
+      const tsRespawn  = Math.floor(e.respawnTime / 1000);
+      const serverTime = toServerTimeStr(e.respawnTime);
+      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${serverTime} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
     } else if (windowLeft <= 0) {
-      const lastKnown = `<t:${Math.floor(e.respawnTime / 1000)}:F>`;
-      text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${lastKnown}\n👤 ${e.lastKiller}`;
+      const serverTime = toServerDateTimeStr(e.respawnTime);
+      text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${serverTime} (server)\n👤 ${e.lastKiller}`;
       isBroken = true;
     } else {
       const tsRespawn  = Math.floor(e.respawnTime / 1000);
       const serverTime = toServerTimeStr(e.respawnTime);
       text =
         `🔴 ${format(cooldown)}\n` +
-        `🕒 Server time: ${serverTime} — Your time: <t:${tsRespawn}:t>\n` +
+        `🕒 ${serverTime} (server) — <t:${tsRespawn}:t> (your time)\n` +
         `👤 ${e.lastKiller}`;
     }
 
@@ -734,7 +736,7 @@ client.on(Events.InteractionCreate, async interaction => {
     await announceKill(
       interaction.channel, interaction.user,
       `killed **${boss.name}**`,
-      `🕒 Kill: <t:${Math.floor(now / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
+      `🕒 Kill: ${toServerDateTimeStr(now)} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`
     );
 
     return interaction.deferUpdate();
@@ -764,7 +766,7 @@ client.on(Events.InteractionCreate, async interaction => {
     await announceKill(
       interaction.channel, interaction.user,
       `killed **${boss.name}** (window kill)`,
-      `🕒 Kill: <t:${Math.floor(now / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
+      `🕒 Kill: ${toServerDateTimeStr(now)} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`
     );
 
     return interaction.deferUpdate();
@@ -812,7 +814,7 @@ client.on(Events.InteractionCreate, async interaction => {
     await announceKill(
       interaction.channel, interaction.user,
       `manually set **${boss.name}** kill time (from window)`,
-      `🕒 Kill: <t:${Math.floor(kill.getTime() / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
+      `🕒 Kill: ${toServerDateTimeStr(kill.getTime())} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`
     );
 
     return interaction.deferUpdate();
@@ -830,56 +832,34 @@ client.on(Events.InteractionCreate, async interaction => {
       .addOptions(BOSSES.map(b => ({ label: b.name, value: b.id })));
 
     return interaction.reply({
-      content: "📝 Select boss to insert kill time:",
+      content: "📝 Select boss — enter kill time in server time (HH:MM, 24h):",
       components: [new ActionRowBuilder().addComponents(menu)],
       flags: MessageFlags.Ephemeral
     });
   }
 
-  // INSERT TIME — step 2: pick timezone mode
+  // INSERT TIME — step 2: show server-time modal directly
   if (interaction.isStringSelectMenu() && interaction.customId === "select_boss_insert") {
     const id   = interaction.values[0];
     const boss = BOSSES.find(b => b.id === id);
 
-    log(interaction.user, `Insert: selected boss ${boss.name}, showing timezone choice`);
-
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId("select_tzmode_" + id)
-      .setPlaceholder("Which time format will you enter?")
-      .addOptions([
-        { label: "🌍 Server time (HH:MM, 24h)", description: "Enter the kill time in server timezone", value: "server" },
-        { label: "🏠 My local time (HH:MM, 24h)", description: "Enter the kill time in your own timezone", value: "local" }
-      ]);
-
-    return interaction.reply({
-      content: `⏱️ How will you enter the kill time for **${boss.name}**?`,
-      components: [new ActionRowBuilder().addComponents(menu)],
-      flags: MessageFlags.Ephemeral
-    });
-  }
-
-  // INSERT TIME — step 3: show modal
-  if (interaction.isStringSelectMenu() && interaction.customId.startsWith("select_tzmode_")) {
-    const id   = interaction.customId.replace("select_tzmode_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const mode = interaction.values[0];
-
-    log(interaction.user, `Insert: ${boss.name} — chose ${mode} time input`);
+    log(interaction.user, `Insert: selected boss ${boss.name} — opening server time modal`);
 
     const modal = new ModalBuilder()
-      .setCustomId(`killtime_${mode}_${id}`)
+      .setCustomId(`killtime_server_${id}`)
       .setTitle(`Insert Kill Time — ${boss.name}`);
     modal.addComponents(new ActionRowBuilder().addComponents(
       new TextInputBuilder()
         .setCustomId("time")
-        .setLabel(mode === "server" ? "HH:MM (24h, server time)" : "HH:MM (24h, your local time)")
+        .setLabel("HH:MM (24h, server time)")
         .setStyle(TextInputStyle.Short)
+        .setPlaceholder("e.g. 21:34")
     ));
 
     return interaction.showModal(modal);
   }
 
-  // INSERT TIME — step 4a: save (server time)
+  // INSERT TIME — step 3: save (server time)
   if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_server_")) {
     snapshot();
 
@@ -891,41 +871,13 @@ client.on(Events.InteractionCreate, async interaction => {
 
     data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
-    log(interaction.user, `MANUAL SET (server time) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
+    log(interaction.user, `MANUAL SET ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
 
     await announceKill(
       interaction.channel, interaction.user,
       `manually set **${boss.name}** kill time`,
-      `🕒 Kill: <t:${Math.floor(kill.getTime() / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
-    );
-
-    return interaction.deferUpdate();
-  }
-
-  // INSERT TIME — step 4b: save (local time)
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_local_")) {
-    snapshot();
-
-    const id          = interaction.customId.replace("killtime_local_", "");
-    const boss        = BOSSES.find(b => b.id === id);
-    const [h, m]      = interaction.fields.getTextInputValue("time").split(":").map(Number);
-    const now         = new Date();
-    const kill        = new Date(now);
-    kill.setHours(h, m, 0, 0);
-    if (kill > now) kill.setDate(kill.getDate() - 1);
-
-    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
-
-    data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
-    save();
-    log(interaction.user, `MANUAL SET (local time) ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
-    spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
-
-    await announceKill(
-      interaction.channel, interaction.user,
-      `manually set **${boss.name}** kill time (local time)`,
-      `🕒 Kill: <t:${Math.floor(kill.getTime() / 1000)}:F> — 🔄 Respawn: <t:${Math.floor(respawnTime / 1000)}:F>`
+      `🕒 Kill: ${toServerDateTimeStr(kill.getTime())} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`
     );
 
     return interaction.deferUpdate();
