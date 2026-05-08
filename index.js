@@ -682,26 +682,14 @@ async function checkFixedEvents(channel) {
     for (const hhmm of ev.times) {
       const warnMs = ev.warnMinutes * 60 * 1000;
 
-      // Find the most recent past occurrence of this event time (could be
-      // today or yesterday in server TZ) and also the next future one.
-      // We want to fire if now falls in [eventMs - warnMs, eventMs + 30s].
-      // nextOccurrenceMs returns the next time >= now, so to get the
-      // "current or most recent" occurrence we look one period back.
       const nextMs = nextOccurrenceMs(hhmm, now);
-      // Previous occurrence = nextMs minus one day... but events repeat at
-      // fixed times, not every 24h uniformly. Simpler: also check nextMs
-      // itself (if it's in warn range) and the occurrence just before now.
       const prevMs = nextOccurrenceMs(hhmm, now - 24 * 60 * 60 * 1000);
 
       for (const eventMs of [prevMs, nextMs]) {
         const timeUntil = eventMs - now;
 
-        // Fire if we are within the warn window, including up to 30s AFTER
-        // the warning should have fired (covers tick jitter / brief restarts).
         if (timeUntil > warnMs || timeUntil < -30 * 1000) continue;
 
-        // Key: use the event's own UTC timestamp (rounded to the minute) so
-        // it's stable regardless of server TZ date boundaries.
         const roundedEventMinute = Math.round(eventMs / 60000);
         const key = `${ev.name}|${hhmm}|${roundedEventMinute}`;
         if (eventPingedKeys.has(key)) continue;
@@ -719,7 +707,6 @@ async function checkFixedEvents(channel) {
         }).catch(() => {});
         forwardToLogChannel(msg);
 
-        // Prune old keys to prevent unbounded growth (keep ~last 2 days).
         if (eventPingedKeys.size > 1000) {
           const cutoff = Math.round((now - 48 * 60 * 60 * 1000) / 60000);
           for (const k of eventPingedKeys) {
@@ -827,7 +814,7 @@ function computeWindowOrder() {
   }
   for (const id in missedWindowDashboards) {
     const w = missedWindowDashboards[id];
-    // Only include in ordering once the tracker is visible (15 min before window)
+    // Only include in ordering once the tracker is visible
     if (now < w.visibleAfter) continue;
     missed.push({ key: `missed:${id}`, timeRemaining: w.nextWindowEnd - now, type: "missed", id });
   }
@@ -877,7 +864,8 @@ async function fullRepin(channel) {
         const e = data.kills[entry.id];
         if (!e) continue;
         const windowEnd = e.respawnTime + 60 * 60 * 1000;
-        if (windowEnd + 25 * 60 * 1000 < now) continue;
+        // FIX: expire spawn window card 15 minutes after the window closes (was 25min)
+        if (windowEnd + 15 * 60 * 1000 < now) continue;
 
         const msg = await channel.send({
           embeds: [buildSpawnWindowEmbed(boss, windowEnd)],
@@ -889,8 +877,8 @@ async function fullRepin(channel) {
       } else if (entry.type === "missed") {
         const w = missedWindowDashboards[entry.id];
         if (!w) continue;
-        if (now < w.visibleAfter) continue;           // not yet time to show it
-        if (w.nextWindowEnd + 30 * 60 * 1000 < now) continue; // expired (30min after window closes)
+        if (now < w.visibleAfter) continue;
+        if (w.nextWindowEnd + 30 * 60 * 1000 < now) continue;
 
         const msg = await channel.send({
           embeds: [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
@@ -936,7 +924,8 @@ function startLoop() {
 
     // ── STEP 1: Expire stale window metadata (no API call) ──
     for (const id of Object.keys(spawnWindowMessages)) {
-      if (spawnWindowMessages[id].windowEnd + 25 * 60 * 1000 < now) {
+      // FIX: expire spawn window card 15 minutes after the window closes (was 25min)
+      if (spawnWindowMessages[id].windowEnd + 15 * 60 * 1000 < now) {
         spawnWindowMessages[id].msg && spawnWindowMessages[id].msg.delete().catch(() => {});
         delete spawnWindowMessages[id];
         lastWindowOrder = [];
