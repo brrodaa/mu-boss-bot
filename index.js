@@ -509,14 +509,15 @@ async function clearEveryoneWarning(key) {
 // =====================
 // SPAWN WINDOW EMBEDS & COMPONENTS
 // =====================
-function buildSpawnWindowEmbed(boss, windowEnd) {
+function buildSpawnWindowEmbed(boss, windowStart, windowEnd) {
   const remaining = windowEnd - Date.now();
+  const tsStart   = Math.floor(windowStart / 1000);
   const tsEnd     = Math.floor(windowEnd / 1000);
   const desc = remaining > 0
-    ? `🔥 Boss: **${boss.name}**\n⏳ Time left: **${format(remaining)}**\n🕒 Closes: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
-    : `🔥 Boss: **${boss.name}**\n⌛ Window has closed — log the kill or wait for next respawn`;
+    ? `⏳ Time left: **${format(remaining)}**\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closes: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
+    : `⌛ Window has closed — log the kill or wait for next respawn\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closed: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`;
   return new EmbedBuilder()
-    .setTitle(`⚠️ ${boss.name} SPAWN WINDOW ACTIVE`)
+    .setTitle(`⚠️ ${boss.name} — Spawn window active with possible wrong timer`)
     .setColor(0xffcc00)
     .setDescription(desc);
 }
@@ -667,7 +668,7 @@ async function fullRepin(channel) {
     for (const [id, w] of spawnEntries) {
       try {
         const msg = await channel.send({
-          embeds:     [buildSpawnWindowEmbed(w.boss, w.windowEnd)],
+          embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
           components: buildSpawnWindowComponents(id),
           flags:      MessageFlags.SuppressNotifications
         });
@@ -699,7 +700,8 @@ async function fullRepin(channel) {
 // =====================
 async function createSpawnWindow(boss, id, channel, windowEnd) {
   if (spawnWindowMessages[id]) return;
-  spawnWindowMessages[id] = { msg: null, windowEnd, boss, deleteTimer: null };
+  const windowStart = windowEnd - 60 * 60 * 1000;
+  spawnWindowMessages[id] = { msg: null, windowStart, windowEnd, boss, deleteTimer: null };
   lastStackFingerprint = "";
 }
 
@@ -957,7 +959,7 @@ function startLoop() {
         .filter(([, w]) => w.msg)
         .map(([id, w]) =>
           w.msg.edit({
-            embeds:     [buildSpawnWindowEmbed(w.boss, w.windowEnd)],
+            embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
             components: buildSpawnWindowComponents(id)
           }).catch(err => {
             if (err.code === 10008) { delete spawnWindowMessages[id]; lastStackFingerprint = ""; }
