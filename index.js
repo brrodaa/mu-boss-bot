@@ -64,7 +64,7 @@ let backupSlotIndex = 0;
 let logMessage      = null;
 
 // Repin the entire stack when REPIN_AFTER_MS has passed since the last repin.
-const REPIN_AFTER_MS = 3 * 60 * 1000;
+const REPIN_AFTER_MS = 30 * 1000;
 let lastRepinTime    = Date.now();
 
 // @everyone warning lifespan = 10 minutes (same as before).
