@@ -773,13 +773,14 @@ async function tickMissedWindowMessages(channel) {
     const untilStart = w.nextWindowStart - now;
     const untilEnd   = w.nextWindowEnd   - now;
 
-    // @everyone when 2h window opens (once)
+    // @everyone when 2h window opens (once) — single merged message
     if (!w.pingedStart && untilStart <= 0 && untilEnd > 0) {
       w.pingedStart = true;
+      const tsClose = Math.floor(w.nextWindowEnd / 1000);
       const content =
-        `@everyone 🔶 **${w.boss.name}** next possible spawn window is now open!\n` +
-        `⚠️ This timer might be incorrect — boss may take longer to respawn.\n` +
-        `Window closes in **${format(untilEnd)}** (${toServerTimeStr(w.nextWindowEnd)} server time)`;
+        `@everyone 🔶 **${w.boss.name}** missed window is now open! ` +
+        `Window closes in **${format(untilEnd)}** — ${toServerTimeStr(w.nextWindowEnd)} (server) — <t:${tsClose}:t> (your time)\n` +
+        `⚠️ Timer might be incorrect — boss may take longer to respawn.`;
       channel.send(content);
       forwardToLogChannel(content);
     }
@@ -935,9 +936,7 @@ function startLoop() {
     const currentFingerprint = computeStackFingerprint();
     if (currentFingerprint !== lastStackFingerprint) {
       await fullRepin(channel);
-      checkWarnings(channel);
-      await checkFixedEvents(channel);
-      return;
+      // Always fall through to warnings/events — never skip them due to a repin
     }
 
     // STEP 2: Fast path — all edits fired concurrently
@@ -999,7 +998,10 @@ function checkWarnings(channel) {
 
     if (cooldown > 0 && cooldown <= 5 * 60 * 1000 && !w.warned5) {
       w.warned5 = true;
-      postEveryoneWarning(channel, `${b.id}_5min`, `@everyone ⏳ **${b.name}** spawns in 5 minutes`);
+      // Skip the 5-min ping if a missed window tracker already handles this boss
+      if (!missedWindowMessages[b.id]) {
+        postEveryoneWarning(channel, `${b.id}_5min`, `@everyone ⏳ **${b.name}** spawns in 5 minutes`);
+      }
     }
 
     if (cooldown <= 0 && windowLeft > 2 * 60 * 1000 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
@@ -1009,7 +1011,10 @@ function checkWarnings(channel) {
 
     if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
       w.windowCreated = true;
-      createSpawnWindow(b, b.id, channel, windowEnd);
+      // Skip the 1h spawn window card if a missed window tracker already covers this boss
+      if (!missedWindowMessages[b.id]) {
+        createSpawnWindow(b, b.id, channel, windowEnd);
+      }
     }
 
     if (
