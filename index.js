@@ -237,8 +237,17 @@ function save() {
 async function recoverFromDiscordBackup() {
   if (!DATA_BACKUP_CHANNEL_ID) return false;
 
-  const localEmpty = !fs.existsSync("data.json") ||
-    Object.keys(JSON.parse(fs.readFileSync("data.json", "utf8")).kills || {}).length === 0;
+  const now = Date.now();
+  const localEmpty =
+    !fs.existsSync("data.json") ||
+    (() => {
+      try {
+        const d = JSON.parse(fs.readFileSync("data.json", "utf8"));
+        // Recover if no kills exist, or every kill's respawn window has been
+        // expired for more than 2 hours (i.e. the data is stale/wiped)
+        return !d.kills || Object.values(d.kills).every(e => e.respawnTime < now - 2 * 60 * 60 * 1000);
+      } catch { return true; }
+    })();
 
   if (!localEmpty) {
     console.log("[Recovery] Local data.json exists and has timers — skipping Discord recovery.");
@@ -554,7 +563,9 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
 
   spawnWindowMessages[id] = { msg, windowEnd, boss };
 
-  const deleteAfter = (windowEnd - Date.now()) + 15 * 60 * 1000;
+  // FIX: Extended from 15 to 25 minutes past windowEnd so the message
+  // lingers long enough for the 10-minute missed-window grace period.
+  const deleteAfter = (windowEnd - Date.now()) + 25 * 60 * 1000;
   setTimeout(() => {
     msg.delete().catch(() => {});
     delete spawnWindowMessages[id];
@@ -934,9 +945,11 @@ function checkWarnings(channel) {
       createSpawnWindow(b, b.id, channel, windowEnd);
     }
 
+    // FIX: Wait 10 minutes after window expiry before auto-advancing,
+    // giving the spawn window message time to linger and be acted on.
     if (
       TRACKED_BOSS_TYPES.has(b.type) &&
-      timeSinceWindowExpired >= 0 &&
+      timeSinceWindowExpired >= 10 * 60 * 1000 &&
       !w.missedHandled
     ) {
       w.missedHandled = true;
