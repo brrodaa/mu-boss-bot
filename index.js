@@ -722,12 +722,8 @@ async function handleMissedWindow(boss, id, channel) {
 
   spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
 
-  // Clean up any previous missed window card for this boss
-  if (missedWindowMessages[id]) {
-    clearTimeout(missedWindowMessages[id].deleteTimer);
-    if (missedWindowMessages[id].msg) missedWindowMessages[id].msg.delete().catch(() => {});
-    delete missedWindowMessages[id];
-  }
+  // Kill the yellow spawn window card and any warnings — the orange tracker takes over
+  clearBossCards(id);
 
   const nextWindowStart = e.respawnTime;
   const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
