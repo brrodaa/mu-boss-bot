@@ -616,6 +616,7 @@ async function handleMissedWindow(boss, id, channel) {
     pinged1h:    false,
     pinged20min: false,
     boss,
+    lastRepinTime: Date.now(),
   };
 }
 
@@ -650,9 +651,43 @@ async function tickMissedWindowDashboards(channel) {
   for (const id in missedWindowDashboards) {
     const w = missedWindowDashboards[id];
 
-    w.msg.edit({
-      embeds: [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)]
-    }).catch(() => {});
+    // ── Repin if message is missing or older than REPIN_AFTER_MS ──
+    const msgAlive = w.msg
+      ? await w.msg.fetch().then(() => true).catch(() => false)
+      : false;
+
+    if (!msgAlive || now - (w.lastRepinTime || 0) >= REPIN_AFTER_MS) {
+      // Delete old message if it still exists
+      if (w.msg) w.msg.delete().catch(() => {});
+
+      const newMsg = await channel.send({
+        embeds: [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("missed_kill_" + id)
+              .setLabel("💀 Killed")
+              .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+              .setCustomId("missed_settime_" + id)
+              .setLabel("⏱️ Set Time")
+              .setStyle(ButtonStyle.Secondary)
+          )
+        ],
+        flags: MessageFlags.SuppressNotifications
+      }).catch(() => null);
+
+      if (newMsg) {
+        w.msg           = newMsg;
+        w.lastRepinTime = now;
+        lastWindowOrder = []; // new message ID means order tracking needs refresh
+      }
+    } else {
+      // Fast path — edit in place
+      w.msg.edit({
+        embeds: [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)]
+      }).catch(() => {});
+    }
 
     const untilStart = w.nextWindowStart - now;
     const untilEnd   = w.nextWindowEnd   - now;
@@ -835,73 +870,39 @@ function computeWindowOrder() {
 }
 
 /**
- * Main ordering routine. Called every tick.
+ * Reorders window messages only — never touches the dashboard.
  *
- * Strategy:
- * 1. Compute what the correct order should be.
- * 2. Check that every active window message still exists on Discord.
- * 3. If the order differs from last tick OR any message is gone → rebuild.
- * 4. Rebuilding = delete all window messages, repin dashboard, repost windows in order.
+ * Called when the desired order differs from lastWindowOrder.
+ * Deletes all current window messages and reposts them in sorted order
+ * (soonest deadline first) so they stay correctly ordered below the dashboard.
  */
 async function reorderWindowMessages(channel) {
   if (reorderInProgress) return;
 
-  const desired = computeWindowOrder();
-  const desiredKeys = desired.map(e => e.key);
-
-  // Fast path: if nothing changed, just edit in place (handled by main loop).
-  if (JSON.stringify(desiredKeys) === JSON.stringify(lastWindowOrder) && dashboardMessage) {
-    return;
-  }
-
   reorderInProgress = true;
   try {
-    // 1. Expire & clean up spawn windows whose window has fully passed
-    //    (windowEnd + 25 min grace). Missed windows clean themselves up via
-    //    their own logic; we remove them here only if nextWindowEnd is > 2h ago.
     const now = Date.now();
 
-    for (const id in spawnWindowMessages) {
-      const w = spawnWindowMessages[id];
-      if (w.windowEnd + 25 * 60 * 1000 < now) {
-        w.msg.delete().catch(() => {});
-        delete spawnWindowMessages[id];
-      }
-    }
-
-    for (const id in missedWindowDashboards) {
-      const w = missedWindowDashboards[id];
-      if (w.nextWindowEnd + 15 * 60 * 1000 < now) {
-        w.msg.delete().catch(() => {});
-        delete missedWindowDashboards[id];
-      }
-    }
-
-    // 2. Delete all existing window messages so we can repost in order.
-    for (const id in spawnWindowMessages) {
+    // 1. Delete all existing window messages (metadata kept, msg nulled).
+    for (const id of Object.keys(spawnWindowMessages)) {
       spawnWindowMessages[id].msg.delete().catch(() => {});
       delete spawnWindowMessages[id];
     }
-    for (const id in missedWindowDashboards) {
-      missedWindowDashboards[id].msg.delete().catch(() => {});
-      // Keep the metadata; we'll repost the message below.
+    for (const id of Object.keys(missedWindowDashboards)) {
+      missedWindowDashboards[id].msg && missedWindowDashboards[id].msg.delete().catch(() => {});
       missedWindowDashboards[id].msg = null;
     }
 
-    // 3. Repin dashboard (this also ensures it sits above all window messages).
-    await repinDashboard(channel);
-
-    // 4. Repost window messages in desired order (soonest first).
-    const recomputed = computeWindowOrder();  // re-compute after cleanup
-
-    for (const entry of recomputed) {
+    // 2. Repost in sorted order (soonest deadline first).
+    const entries = computeWindowOrder();
+    for (const entry of entries) {
       if (entry.type === "spawn") {
         const boss = BOSSES.find(b => b.id === entry.id);
         if (!boss) continue;
         const e = data.kills[entry.id];
         if (!e) continue;
         const windowEnd = e.respawnTime + 60 * 60 * 1000;
-        if (windowEnd < now) continue; // already expired
+        if (windowEnd + 25 * 60 * 1000 < now) continue;
 
         const msg = await channel.send({
           embeds: [buildSpawnWindowEmbed(boss, windowEnd)],
@@ -913,7 +914,7 @@ async function reorderWindowMessages(channel) {
       } else if (entry.type === "missed") {
         const w = missedWindowDashboards[entry.id];
         if (!w) continue;
-        if (w.nextWindowEnd + 15 * 60 * 1000 < now) continue; // already expired
+        if (w.nextWindowEnd + 15 * 60 * 1000 < now) continue;
 
         const msg = await channel.send({
           embeds: [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
@@ -932,12 +933,12 @@ async function reorderWindowMessages(channel) {
           flags: MessageFlags.SuppressNotifications
         });
         missedWindowDashboards[entry.id].msg = msg;
+        missedWindowDashboards[entry.id].lastRepinTime = Date.now();
       }
     }
 
-    // 5. Record the new order.
     lastWindowOrder = computeWindowOrder().map(e => e.key);
-    console.log(`[Order] Reordered: [${lastWindowOrder.join(", ")}]`);
+    console.log(`[Order] Windows reordered: [${lastWindowOrder.join(", ")}]`);
 
   } catch (err) {
     console.error("[Order] reorderWindowMessages error:", err);
@@ -966,95 +967,62 @@ function startLoop() {
   setInterval(async () => {
     if (!dashboardMessage) return;
     const channel = dashboardMessage.channel;
-
     const now = Date.now();
 
-    // ── Check if any window messages need to be expired ──
-    let needsReorder = false;
-
-    for (const id in spawnWindowMessages) {
+    // ── STEP 1: Expire stale window messages ──
+    for (const id of Object.keys(spawnWindowMessages)) {
       const w = spawnWindowMessages[id];
       if (w.windowEnd + 25 * 60 * 1000 < now) {
-        needsReorder = true;
-        break;
+        w.msg.delete().catch(() => {});
+        delete spawnWindowMessages[id];
+        lastWindowOrder = [];
       }
     }
-    for (const id in missedWindowDashboards) {
+    for (const id of Object.keys(missedWindowDashboards)) {
       const w = missedWindowDashboards[id];
       if (w.nextWindowEnd + 15 * 60 * 1000 < now) {
-        needsReorder = true;
-        break;
+        w.msg && w.msg.delete().catch(() => {});
+        delete missedWindowDashboards[id];
+        lastWindowOrder = [];
       }
     }
 
-    // ── Compute desired order and check if it changed ──
+    // ── STEP 2: Check for externally-deleted window messages ──
+    for (const id of Object.keys(spawnWindowMessages)) {
+      const alive = await spawnWindowMessages[id].msg.fetch().then(() => true).catch(() => false);
+      if (!alive) { delete spawnWindowMessages[id]; lastWindowOrder = []; }
+    }
+    for (const id of Object.keys(missedWindowDashboards)) {
+      const w = missedWindowDashboards[id];
+      if (!w.msg) continue;
+      const alive = await w.msg.fetch().then(() => true).catch(() => false);
+      if (!alive) { missedWindowDashboards[id].msg = null; lastWindowOrder = []; }
+    }
+
+    // ── STEP 3: Reorder windows if needed (never touches the dashboard) ──
     const desired = computeWindowOrder().map(e => e.key);
-    if (JSON.stringify(desired) !== JSON.stringify(lastWindowOrder)) {
-      needsReorder = true;
-    }
-
-    // ── Also check if dashboard or any window message was deleted externally ──
-    if (!needsReorder) {
-      const dashboardAlive = await dashboardMessage.fetch().then(() => true).catch(() => false);
-      if (!dashboardAlive) needsReorder = true;
-    }
-
-    if (needsReorder) {
-      // reorderWindowMessages handles the repin internally
+    if (JSON.stringify(desired) !== JSON.stringify(lastWindowOrder) && !reorderInProgress) {
       await reorderWindowMessages(channel);
-      checkWarnings(channel);
-      await tickMissedWindowDashboards(channel);
-      await checkFixedEvents(channel);
-      return;
     }
 
-    // ── Regular repin cycle (30s) ──
-    if (now - lastRepinTime >= REPIN_AFTER_MS) {
-      // Only repin dashboard; windows are already in correct order
-      if (dashboardMessage) await dashboardMessage.delete().catch(() => {});
-      dashboardMessage = await channel.send({
-        embeds: [buildEmbed()],
-        components: buildButtons(),
-        flags: MessageFlags.SuppressNotifications
-      });
-      lastRepinTime = now;
-      // Now repost all window messages in order below dashboard
-      await reorderWindowMessages(channel);
-      checkWarnings(channel);
-      await tickMissedWindowDashboards(channel);
-      await checkFixedEvents(channel);
-      return;
+    // ── STEP 4: Dashboard repin (independent — never tears down window messages) ──
+    const dashboardAlive = await dashboardMessage.fetch().then(() => true).catch(() => false);
+    if (!dashboardAlive || now - lastRepinTime >= REPIN_AFTER_MS) {
+      await repinDashboard(channel);
+    } else {
+      dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() }).catch(() => {});
     }
 
-    // ── Fast path: just edit everything in-place ──
-    try {
-      await dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() });
-    } catch (err) {
-      if (err.code === 10008) {
-        await reorderWindowMessages(channel);
-        checkWarnings(channel);
-        await tickMissedWindowDashboards(channel);
-        await checkFixedEvents(channel);
-        return;
-      }
-    }
-
-    // Edit spawn windows in-place
+    // ── STEP 5: Edit window messages in place (content update only, no repost) ──
     for (const id in spawnWindowMessages) {
       const w = spawnWindowMessages[id];
       w.msg.edit({
         embeds: [buildSpawnWindowEmbed(w.boss, w.windowEnd)],
         components: buildSpawnWindowComponents(id)
-      }).catch(err => {
-        if (err.code === 10008) {
-          // Message was deleted externally — trigger reorder next tick
-          delete spawnWindowMessages[id];
-          lastWindowOrder = [];
-        }
-      });
+      }).catch(() => {});
     }
 
-    // Edit missed-window dashboards in-place (tickMissedWindowDashboards does this)
+    // ── STEP 6: Warnings, missed-window ticks, fixed events ──
     checkWarnings(channel);
     await tickMissedWindowDashboards(channel);
     await checkFixedEvents(channel);
