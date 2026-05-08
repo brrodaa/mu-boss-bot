@@ -536,16 +536,23 @@ async function forwardToLogChannel(content) {
 // =====================
 // SPAWN WINDOW
 // =====================
+function buildSpawnWindowEmbed(boss, windowEnd) {
+  const remaining = windowEnd - Date.now();
+  const tsEnd     = Math.floor(windowEnd / 1000);
+  const desc = remaining > 0
+    ? `🔥 Boss: **${boss.name}**\n⏳ Time left: **${format(remaining)}**\n🕒 Closes at: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
+    : `🔥 Boss: **${boss.name}**\n⌛ Window has just closed — awaiting kill log or missed-window advance`;
+  return new EmbedBuilder()
+    .setTitle(`⚠️ ${boss.name} SPAWN WINDOW ACTIVE`)
+    .setColor(0xffcc00)
+    .setDescription(desc);
+}
+
 async function createSpawnWindow(boss, id, channel, windowEnd) {
   if (spawnWindowMessages[id]) return;
 
   const msg = await channel.send({
-    embeds: [
-      new EmbedBuilder()
-        .setTitle(`⚠️ ${boss.name} MAY SPAWN`)
-        .setColor(0xffcc00)
-        .setDescription(`🔥 Boss: **${boss.name}**\n⏳ Live window started`)
-    ],
+    embeds: [buildSpawnWindowEmbed(boss, windowEnd)],
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -573,12 +580,19 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
 }
 
 async function recreateActiveSpawnWindows(channel) {
+  // On repin we only need to recreate windows whose Discord message was
+  // deleted along with the old dashboard area. If the message is still
+  // alive (bot can still edit it) we leave it alone to avoid spam.
   const now = Date.now();
   for (const id in spawnWindowMessages) {
     const w = spawnWindowMessages[id];
-    w.msg.delete().catch(() => {});
+    const stillAlive = await w.msg.fetch().then(() => true).catch(() => false);
+    if (stillAlive) continue; // message is fine, nothing to do
+
     delete spawnWindowMessages[id];
-    if (w.windowEnd > now) {
+    // Only repost if window hasn't been expired for more than 25 min
+    // (matches the self-delete timer so we don't resurrect dead windows)
+    if (w.windowEnd + 25 * 60 * 1000 > now) {
       await createSpawnWindow(w.boss, id, channel, w.windowEnd);
     }
   }
@@ -889,16 +903,9 @@ function startLoop() {
 
     const now = Date.now();
     for (const id in spawnWindowMessages) {
-      const w         = spawnWindowMessages[id];
-      const remaining = w.windowEnd - now;
-      if (remaining <= 0) continue;
+      const w = spawnWindowMessages[id];
       w.msg.edit({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle(`⚠️ ${w.boss.name} SPAWN WINDOW ACTIVE`)
-            .setColor(0xffcc00)
-            .setDescription(`🔥 Boss: **${w.boss.name}**\n⏳ Time left: **${format(remaining)}**`)
-        ]
+        embeds: [buildSpawnWindowEmbed(w.boss, w.windowEnd)]
       }).catch(() => {});
     }
 
