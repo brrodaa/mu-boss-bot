@@ -81,6 +81,9 @@ let logMessage      = null;
 let lastStackFingerprint = "";
 let repinInProgress = false;
 
+const BOT_START_TIME = Date.now();
+const STARTUP_GRACE_MS = 30 * 1000;
+
 // =====================
 // BOSSES
 // =====================
@@ -984,6 +987,10 @@ function startLoop() {
 // =====================
 function checkWarnings(channel) {
   const now = Date.now();
+
+  // Don't fire any warnings during the startup grace period to avoid
+  // ghost-pinging for timers that were already past their threshold before restart
+  if (now - BOT_START_TIME < STARTUP_GRACE_MS) return;
 
   for (const b of BOSSES) {
     const e = data.kills[b.id];
