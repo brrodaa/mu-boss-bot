@@ -517,8 +517,8 @@ function buildSpawnWindowEmbed(boss, windowStart, windowEnd) {
     ? `⏳ Time left: **${format(remaining)}**\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closes: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
     : `⌛ Window has closed — log the kill or wait for next respawn\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closed: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`;
   return new EmbedBuilder()
-    .setTitle(`⚠️ ${boss.name} — Spawn window active with possible wrong timer`)
-    .setColor(0xffcc00)
+    .setTitle(`🟢 ${boss.name} — Spawn window active`)
+    .setColor(0x00cc66)
     .setDescription(desc);
 }
 
@@ -549,7 +549,7 @@ function buildMissedWindowEmbed(boss, windowStart, windowEnd) {
   }
 
   return new EmbedBuilder()
-    .setTitle(`🔶 ${boss.name} — Missed Window Tracker`)
+    .setTitle(`⚠️ ${boss.name} — Spawn window active with possible wrong timer`)
     .setColor(0xff6600)
     .setDescription(
       `${statusLine}\n\n` +
@@ -1295,15 +1295,20 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 
   if (interaction.isButton() && interaction.customId === "undo") {
-    const ok = undo();
-    log(interaction.user, ok ? `UNDO success` : `UNDO failed — nothing to undo`);
-    await announceAdmin(interaction.channel, interaction.user, ok ? "used **Undo** ↩️" : "tried to undo — nothing to undo");
+    if (undo()) {
+      log(interaction.user, `UNDO`);
+      for (const id of Object.keys(spawnWarnings))
+        spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
+      await announceAdmin(interaction.channel, interaction.user, "used **undo**");
+    }
     return interaction.deferUpdate();
   }
 
   if (interaction.isButton() && interaction.customId === "show_logs") {
-    log(interaction.user, `Viewed logs`);
-    return interaction.reply({ embeds: [buildLogEmbed()], flags: MessageFlags.Ephemeral });
+    return interaction.reply({
+      embeds: [buildLogEmbed()],
+      flags: MessageFlags.Ephemeral
+    });
   }
 });
 
