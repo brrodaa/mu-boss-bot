@@ -23,12 +23,12 @@ const path = require("path");
 //
 // DATA_BACKUP_CHANNEL_ID — the private "bot-logs" channel where the 7
 //   rotating backup slots are posted. The bot also reads this channel on
-//   startup to restore timers after a redeploy. Set to 1501499727877898311.
+//   startup to restore timers after a redeploy.
 // =====================
 const TOKEN                  = process.env.BOT_TOKEN;
 const CHANNEL_ID             = process.env.CHANNEL_ID;
 const LOG_CHANNEL_ID         = process.env.LOG_CHANNEL_ID;
-const DATA_BACKUP_CHANNEL_ID = process.env.DATA_BACKUP_CHANNEL_ID; // bot-logs
+const DATA_BACKUP_CHANNEL_ID = process.env.DATA_BACKUP_CHANNEL_ID;
 
 if (!TOKEN || !CHANNEL_ID) {
   console.error("ERROR: Missing BOT_TOKEN or CHANNEL_ID environment variables.");
@@ -63,13 +63,12 @@ let adminLogs  = [];
 let undoStack  = [];
 
 // Tracks missed-window dashboards for Kharzul/Vescrya auto-advance feature.
-// Key = boss id, value = { msg, nextWindowStart, nextWindowEnd, pingedStart: bool }
 let missedWindowDashboards = {};
 
 // Persistent Discord messages — posted once on startup, edited forever.
 const MAX_DISCORD_BACKUPS = 7;
-let backupMessages  = [];  // Message objects, index 0 = slot 1
-let backupSlotIndex = 0;   // round-robin pointer
+let backupMessages  = [];
+let backupSlotIndex = 0;
 let logMessage      = null;
 
 const REPIN_AFTER_INTERACTIONS = 3;
@@ -97,8 +96,6 @@ const TRACKED_BOSS_TYPES = new Set(["kharzul", "vescrya"]);
 // =====================
 // FIXED EVENTS
 // =====================
-// Each event: name, times in server time "HH:MM", warnMinutes (how many minutes before to ping),
-// extraNote (optional extra text appended to ping), and warnedKeys (runtime set of already-pinged keys)
 const FIXED_EVENTS = [
   {
     name: "🟡 Golden Invasion",
@@ -143,8 +140,6 @@ const FIXED_EVENTS = [
   },
 ];
 
-// Runtime state: tracks which event+time combos have already been pinged this cycle.
-// Key format: "EventName|HH:MM|YYYY-MM-DD" — resets naturally as the date rolls over.
 const eventPingedKeys = new Set();
 
 // =====================
@@ -184,12 +179,10 @@ function toServerDateTimeStr(ms) {
   });
 }
 
-// Returns the next UTC ms at which a server-time "HH:MM" will occur, on or after `afterMs`.
 function nextOccurrenceMs(hhmm, afterMs) {
   const [h, m]  = hhmm.split(":").map(Number);
   const afterDt = new Date(afterMs);
 
-  // Try today and tomorrow in server timezone
   for (let dayOffset = 0; dayOffset <= 1; dayOffset++) {
     const base = new Date(afterDt);
     base.setDate(base.getDate() + dayOffset);
@@ -199,18 +192,13 @@ function nextOccurrenceMs(hhmm, afterMs) {
     const utcMs     = candidate.getTime() - tzOffset;
     if (utcMs >= afterMs) return utcMs;
   }
-  // fallback (shouldn't reach)
+
   const afterDt2 = new Date(afterMs);
   afterDt2.setDate(afterDt2.getDate() + 1);
   const dateStr2 = afterDt2.toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
   const candidate2 = new Date(`${dateStr2}T${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`);
   const tzOffset2  = getAmsterdamOffsetMs(candidate2);
   return candidate2.getTime() - tzOffset2;
-}
-
-// Returns current server date string "YYYY-MM-DD"
-function serverDateStr() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
 }
 
 // =====================
@@ -308,6 +296,8 @@ function saveLocalBackup() {
 
 // =====================
 // BACKUP — Discord persistent slots
+// FIX: On redeploy, REUSE existing backup slot messages instead of posting
+//      7 fresh empty ones (which would overwrite the real saved data).
 // =====================
 function buildBackupEmbed(slotNumber, takenAt) {
   const stamp = toServerDateTimeStr(takenAt || Date.now());
@@ -326,6 +316,31 @@ function buildBackupEmbed(slotNumber, takenAt) {
 }
 
 async function initBackupMessages(backupChannel) {
+  // Try to reuse existing backup slot messages from the channel.
+  // This prevents overwriting real timer data on every redeploy.
+  try {
+    const existing = await backupChannel.messages.fetch({ limit: 50 });
+    const botBackups = [...existing.values()]
+      .filter(m =>
+        m.author.id === client.user.id &&
+        m.embeds.length > 0 &&
+        m.embeds[0]?.title?.startsWith("💾 Backup Slot")
+      )
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    if (botBackups.length === MAX_DISCORD_BACKUPS) {
+      backupMessages  = botBackups;
+      backupSlotIndex = 0;
+      console.log(`[Backup] Reusing ${MAX_DISCORD_BACKUPS} existing backup slot messages — no data overwrite.`);
+      return;
+    }
+
+    console.log(`[Backup] Found ${botBackups.length}/${MAX_DISCORD_BACKUPS} existing slots — posting fresh set.`);
+  } catch (err) {
+    console.warn("[Backup] Could not fetch existing backup messages — posting fresh set.", err);
+  }
+
+  // Post fresh slots only if we couldn't find a full existing set.
   backupMessages  = [];
   backupSlotIndex = 0;
   for (let i = 1; i <= MAX_DISCORD_BACKUPS; i++) {
@@ -341,7 +356,7 @@ async function initBackupMessages(backupChannel) {
     });
     backupMessages.push(msg);
   }
-  console.log(`[Backup] ${MAX_DISCORD_BACKUPS} backup slots initialised in bot-logs channel.`);
+  console.log(`[Backup] ${MAX_DISCORD_BACKUPS} fresh backup slots posted in bot-logs channel.`);
 }
 
 async function updateDiscordBackupSlot() {
@@ -461,29 +476,34 @@ function undo() {
 
 // =====================
 // ANNOUNCE HELPERS
+// FIX: forwardToLogChannel sends to the PRIVATE log channel only.
+//      The public channel only gets kill announcements (permanent) and
+//      admin announcements (auto-deleted after 10 min). No spam.
 // =====================
 async function announceKill(channel, user, action, extra = "") {
   const now     = Date.now();
   const content = `⚔️ **${user.username}** ${action} — ${toServerDateTimeStr(now)} (server time)${extra ? `\n${extra}` : ""}`;
-  await channel.send({ content, flags: 4096 });
+  await channel.send({ content, flags: MessageFlags.SuppressNotifications });
   forwardToLogChannel(content);
 }
 
 async function announceAdmin(channel, user, action, extra = "") {
   const now     = Date.now();
   const content = `📢 **${user.username}** ${action} — ${toServerDateTimeStr(now)} (server time)${extra ? `\n${extra}` : ""}`;
-  const msg     = await channel.send({ content, flags: 4096 });
+  const msg     = await channel.send({ content, flags: MessageFlags.SuppressNotifications });
   setTimeout(() => {
-    forwardToLogChannel(content);
     msg.delete().catch(() => {});
   }, 10 * 60 * 1000);
+  forwardToLogChannel(content);
 }
 
 async function forwardToLogChannel(content) {
   if (!LOG_CHANNEL_ID) return;
+  // Never forward to the same channel to avoid double-posting
+  if (LOG_CHANNEL_ID === CHANNEL_ID) return;
   try {
     const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
-    await logCh.send({ content, flags: 4096 });
+    await logCh.send({ content, flags: MessageFlags.SuppressNotifications });
   } catch (err) {
     console.error("[Log Channel] Failed to forward message:", err);
   }
@@ -541,40 +561,27 @@ async function recreateActiveSpawnWindows(channel) {
 // =====================
 // MISSED WINDOW / AUTO-ADVANCE (Kharzul & Vescrya only)
 // =====================
-// When the 1h spawn window expires with no kill recorded for a tracked boss,
-// we start a new 7h cycle from the last known respawn time.
-// A separate "missed window dashboard" message is posted (NOT the main dashboard)
-// with a live 2h countdown showing the next possible window.
-//
-// @everyone is pinged ONCE when the 2h window actually opens (NOT on auto-advance itself).
-// Auto-advance just silently moves the respawnTime forward by 7h.
-
 async function handleMissedWindow(boss, id, channel) {
   const e = data.kills[id];
   if (!e) return;
 
   console.log(`[MissedWindow] No kill recorded for ${boss.name} — auto-advancing by 7h`);
 
-  // Move respawn forward by 7h (new cycle from last respawn)
   snapshot();
   e.respawnTime = e.respawnTime + 7 * 60 * 60 * 1000;
-  e.killTime    = e.respawnTime - 7 * 60 * 60 * 1000; // keep consistent
+  e.killTime    = e.respawnTime - 7 * 60 * 60 * 1000;
   save();
 
-  // Reset spawn warnings for the new cycle
-  spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false };
+  spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
 
-  // Delete any old missed-window dashboard for this boss
   if (missedWindowDashboards[id]) {
     missedWindowDashboards[id].msg.delete().catch(() => {});
     delete missedWindowDashboards[id];
   }
 
-  // The 2h window opens when the new respawn time arrives
   const nextWindowStart = e.respawnTime;
   const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
 
-  // Post the missed-window dashboard (suppress notifications — ping comes later)
   const msg = await channel.send({
     embeds: [buildMissedWindowEmbed(boss, nextWindowStart, nextWindowEnd)],
     components: [
@@ -596,13 +603,12 @@ async function handleMissedWindow(boss, id, channel) {
     msg,
     nextWindowStart,
     nextWindowEnd,
-    pingedStart:   false,
-    pinged1h:      false,
-    pinged20min:   false,
+    pingedStart: false,
+    pinged1h:    false,
+    pinged20min: false,
     boss,
   };
 
-  // Schedule deletion after the 2h window + a buffer
   const ttl = (nextWindowEnd - Date.now()) + 15 * 60 * 1000;
   setTimeout(() => {
     msg.delete().catch(() => {});
@@ -611,9 +617,9 @@ async function handleMissedWindow(boss, id, channel) {
 }
 
 function buildMissedWindowEmbed(boss, windowStart, windowEnd) {
-  const now         = Date.now();
-  const untilStart  = windowStart - now;
-  const untilEnd    = windowEnd   - now;
+  const now        = Date.now();
+  const untilStart = windowStart - now;
+  const untilEnd   = windowEnd   - now;
 
   let statusLine;
   if (untilStart > 0) {
@@ -635,14 +641,12 @@ function buildMissedWindowEmbed(boss, windowStart, windowEnd) {
     .setFooter({ text: `Auto-updating | Window: ${toServerTimeStr(windowStart)} – ${toServerTimeStr(windowEnd)} (server)` });
 }
 
-// Tick function — called from the main loop
 async function tickMissedWindowDashboards(channel) {
   const now = Date.now();
 
   for (const id in missedWindowDashboards) {
     const w = missedWindowDashboards[id];
 
-    // Keep embed updated
     w.msg.edit({
       embeds: [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)]
     }).catch(() => {});
@@ -650,7 +654,6 @@ async function tickMissedWindowDashboards(channel) {
     const untilStart = w.nextWindowStart - now;
     const untilEnd   = w.nextWindowEnd   - now;
 
-    // @everyone when 2h window opens (once)
     if (!w.pingedStart && untilStart <= 0 && untilEnd > 0) {
       w.pingedStart = true;
       channel.send(
@@ -660,7 +663,6 @@ async function tickMissedWindowDashboards(channel) {
       );
     }
 
-    // @everyone at 1h remaining in the 2h window (once)
     if (!w.pinged1h && untilEnd > 0 && untilEnd <= 60 * 60 * 1000) {
       w.pinged1h = true;
       channel.send(
@@ -669,45 +671,35 @@ async function tickMissedWindowDashboards(channel) {
       );
     }
 
-    // @everyone at 20 min remaining (once)
     if (!w.pinged20min && untilEnd > 0 && untilEnd <= 20 * 60 * 1000) {
       w.pinged20min = true;
       channel.send(
         `@everyone ⚠️ **${w.boss.name}** missed-window: **20 minutes remaining** in the spawn window!`
       );
     }
-
-    // If window fully expired and no kill — don't auto-advance again automatically here.
-    // The main checkWarnings → handleMissedWindow path drives the next cycle.
   }
 }
 
 // =====================
 // FIXED EVENT WARNINGS
 // =====================
-// Called every tick. Checks each fixed event's upcoming occurrences.
-// Pings @everyone warnMinutes before, exactly once per occurrence (keyed by date+time).
 async function checkFixedEvents(channel) {
   const now = Date.now();
 
   for (const ev of FIXED_EVENTS) {
     for (const hhmm of ev.times) {
-      const eventMs    = nextOccurrenceMs(hhmm, now);
-      const warnMs     = ev.warnMinutes * 60 * 1000;
-      const timeUntil  = eventMs - now;
+      const eventMs   = nextOccurrenceMs(hhmm, now);
+      const warnMs    = ev.warnMinutes * 60 * 1000;
+      const timeUntil = eventMs - now;
 
-      // Only ping if we're within [warnMs, warnMs + TICK_RATE*2] window
-      // (the extra buffer avoids missed ticks)
       if (timeUntil > warnMs || timeUntil < 0) continue;
 
-      // Build a unique key using the actual event date+time in server tz
-      const eventDate  = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
-      const key        = `${ev.name}|${hhmm}|${eventDate}`;
+      const eventDate = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
+      const key       = `${ev.name}|${hhmm}|${eventDate}`;
 
       if (eventPingedKeys.has(key)) continue;
       eventPingedKeys.add(key);
 
-      // Build ping message
       const eventTimeStr = toServerTimeStr(eventMs);
       const tsEvent      = Math.floor(eventMs / 1000);
 
@@ -719,8 +711,6 @@ async function checkFixedEvents(channel) {
 
       channel.send(msg);
 
-      // Prune old keys older than 25h to avoid unbounded growth
-      // (keys encode the date so they naturally expire — cleanup just trims set size)
       if (eventPingedKeys.size > 500) {
         const yesterday = new Date(now - 25 * 60 * 60 * 1000)
           .toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
@@ -756,7 +746,6 @@ function buildEmbed() {
       const serverTime = toServerTimeStr(e.respawnTime);
       text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${serverTime} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
     } else if (windowLeft <= 0) {
-      // Broken timer state — still shown after 1h window expires
       const serverTime = toServerDateTimeStr(e.respawnTime);
       text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${serverTime} (server)\n👤 ${e.lastKiller}`;
       isBroken = true;
@@ -907,7 +896,6 @@ function checkWarnings(channel) {
     const windowEnd  = e.respawnTime + 60 * 60 * 1000;
     const windowLeft = windowEnd - now;
 
-    // Time since the 1h spawn window ended (positive = window has closed)
     const timeSinceWindowExpired = now - windowEnd;
 
     if (!spawnWarnings[b.id]) {
@@ -931,8 +919,6 @@ function checkWarnings(channel) {
       createSpawnWindow(b, b.id, channel, windowEnd);
     }
 
-    // Auto-advance for tracked boss types (Kharzul & Vescrya) when 1h window closes
-    // with no kill logged. Triggers only once per cycle.
     if (
       TRACKED_BOSS_TYPES.has(b.type) &&
       timeSinceWindowExpired >= 0 &&
@@ -965,7 +951,7 @@ client.once(Events.ClientReady, async () => {
       const backupCh = await client.channels.fetch(DATA_BACKUP_CHANNEL_ID);
       await initBackupMessages(backupCh);
     } catch (err) {
-      console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID, falling back to main channel:", err);
+      console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID:", err);
       await initBackupMessages(channel);
     }
   } else {
@@ -1009,7 +995,6 @@ client.on(Events.InteractionCreate, async interaction => {
     log(interaction.user, `KILLED ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
 
-    // Clean up any missed-window dashboard for this boss
     if (missedWindowDashboards[id]) {
       missedWindowDashboards[id].msg.delete().catch(() => {});
       delete missedWindowDashboards[id];
@@ -1204,7 +1189,7 @@ client.on(Events.InteractionCreate, async interaction => {
     });
   }
 
-  // INSERT TIME — step 2: show server-time modal directly
+  // INSERT TIME — step 2: show modal directly
   if (interaction.isStringSelectMenu() && interaction.customId === "select_boss_insert") {
     const id   = interaction.values[0];
     const boss = BOSSES.find(b => b.id === id);
@@ -1225,7 +1210,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.showModal(modal);
   }
 
-  // INSERT TIME — step 3: save (server time)
+  // INSERT TIME — save (server time)
   if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_server_")) {
     snapshot();
 
@@ -1240,7 +1225,6 @@ client.on(Events.InteractionCreate, async interaction => {
     log(interaction.user, `MANUAL SET ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
     spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
 
-    // Clean up missed-window dashboard if someone inserts a time manually
     if (missedWindowDashboards[id]) {
       missedWindowDashboards[id].msg.delete().catch(() => {});
       delete missedWindowDashboards[id];
@@ -1285,7 +1269,6 @@ client.on(Events.InteractionCreate, async interaction => {
     if (value === "DELETE_ALL") {
       data.kills = {};
       save();
-      // Clean up all missed-window dashboards
       for (const id in missedWindowDashboards) {
         missedWindowDashboards[id].msg.delete().catch(() => {});
       }
