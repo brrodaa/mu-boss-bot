@@ -1,3 +1,19 @@
+// =====================
+// GLOBAL CRASH HANDLERS
+// =====================
+process.on("uncaughtException", (err) => {
+  console.error("[UncaughtException]", err.message, err.stack);
+  // deliberately NOT calling process.exit() so Railway keeps the process alive
+});
+
+process.on("unhandledRejection", (err) => {
+  if (err?.status === 503 || err?.status === 502) {
+    console.warn("[Discord] Temporary API outage (503/502), ignoring");
+    return;
+  }
+  console.error("[UnhandledRejection]", err?.message ?? err);
+});
+
 const {
   Client,
   GatewayIntentBits,
@@ -357,13 +373,20 @@ async function updateDiscordBackupSlot() {
       files: [{ attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-slot${slotNumber}-${isoStamp}.json` }]
     });
     console.log(`[Backup] Slot ${slotNumber} updated.`);
-  } catch (err) { console.error(`[Backup] Slot ${slotNumber} edit failed:`, err); }
+  } catch (err) {
+    // Don't let backup errors propagate — just log what matters
+    if (err.status === 503 || err.status === 502) {
+      console.warn(`[Backup] Slot ${slotNumber} — Discord temporarily unavailable (${err.status}), will retry next cycle`);
+    } else {
+      console.error(`[Backup] Slot ${slotNumber} edit failed: ${err.status} ${err.message}`);
+    }
+  }
   backupSlotIndex = (backupSlotIndex + 1) % MAX_DISCORD_BACKUPS;
 }
 
 async function runBackup() {
   try { console.log(`[Backup] ${saveLocalBackup()}`); await updateDiscordBackupSlot(); }
-  catch (err) { console.error("[Backup]", err); }
+  catch (err) { console.error("[Backup]", err.message ?? err); }
 }
 
 function startBackupLoop() {
@@ -397,7 +420,7 @@ async function initLogMessage(channel) {
 async function updateLogMessage() {
   if (!logMessage) return;
   try { await logMessage.edit({ embeds: [buildLogEmbed()] }); }
-  catch (err) { console.error("[Log] Update failed:", err); }
+  catch (err) { console.error("[Log] Update failed:", err.message ?? err); }
 }
 
 // =====================
@@ -456,7 +479,7 @@ async function forwardToLogChannel(content) {
   try {
     const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
     await logCh.send({ content, flags: MessageFlags.SuppressNotifications });
-  } catch (err) { console.error("[Log Channel]", err); }
+  } catch (err) { console.error("[Log Channel]", err.message ?? err); }
 }
 
 // =====================
@@ -467,7 +490,7 @@ async function postEveryoneWarning(channel, key, content) {
 
   let msg;
   try { msg = await channel.send({ content }); }
-  catch (err) { console.error("[Warning] Failed to post @everyone:", err); return; }
+  catch (err) { console.error("[Warning] Failed to post @everyone:", err.message ?? err); return; }
 
   forwardToLogChannel(content);
   scheduleEveryoneWarningCycle(channel, key, content, msg);
@@ -568,10 +591,6 @@ function buildMissedWindowComponents(id) {
 
 // =====================
 // STACK FINGERPRINT
-//
-// Only missed window entries whose window has actually OPENED are included.
-// Entries waiting for nextWindowStart are tracked in state but invisible
-// in the stack — they appear automatically once the window opens.
 // =====================
 function computeStackFingerprint() {
   const now = Date.now();
@@ -599,7 +618,6 @@ async function fullRepin(channel) {
   try {
     const now = Date.now();
 
-    // 1. Delete all managed messages
     if (dashboardMessage) {
       await dashboardMessage.delete().catch(() => {});
       dashboardMessage = null;
@@ -619,7 +637,6 @@ async function fullRepin(channel) {
       w.msg = null; w.deleteTimer = null;
     }
 
-    // 2. Prune fully expired entries
     for (const id of Object.keys(missedWindowMessages)) {
       if (missedWindowMessages[id].nextWindowEnd + WINDOW_GRACE_MS <= now)
         delete missedWindowMessages[id];
@@ -629,14 +646,12 @@ async function fullRepin(channel) {
         delete spawnWindowMessages[id];
     }
 
-    // 3. Post dashboard
     dashboardMessage = await channel.send({
       embeds:     [buildEmbed()],
       components: buildButtons(),
       flags:      MessageFlags.SuppressNotifications
     });
 
-    // 4. Post missed window cards — ONLY those whose window has opened
     const missedEntries = Object.entries(missedWindowMessages)
       .filter(([, w]) => w.nextWindowStart <= now)
       .sort(([, a], [, b]) => a.nextWindowEnd - b.nextWindowEnd);
@@ -656,12 +671,11 @@ async function fullRepin(channel) {
           lastStackFingerprint = "";
         }, Math.max(ttl, 0));
       } catch (err) {
-        console.error(`[Repin] Failed to post missed window for ${id}:`, err);
+        console.error(`[Repin] Failed to post missed window for ${id}:`, err.message ?? err);
         delete missedWindowMessages[id];
       }
     }
 
-    // 5. Post active spawn window cards (soonest window-end first)
     const spawnEntries = Object.entries(spawnWindowMessages)
       .sort(([, a], [, b]) => a.windowEnd - b.windowEnd);
 
@@ -680,7 +694,7 @@ async function fullRepin(channel) {
           lastStackFingerprint = "";
         }, Math.max(ttl, 0));
       } catch (err) {
-        console.error(`[Repin] Failed to post spawn window for ${id}:`, err);
+        console.error(`[Repin] Failed to post spawn window for ${id}:`, err.message ?? err);
         delete spawnWindowMessages[id];
       }
     }
@@ -689,7 +703,7 @@ async function fullRepin(channel) {
     console.log(`[Repin] Stack: dashboard -> missed:[${Object.keys(missedWindowMessages).filter(id => missedWindowMessages[id].nextWindowStart <= now).join(",")}] -> spawn:[${Object.keys(spawnWindowMessages).join(",")}]`);
 
   } catch (err) {
-    console.error("[Repin] Error:", err);
+    console.error("[Repin] Error:", err.message ?? err);
   } finally {
     repinInProgress = false;
   }
@@ -707,9 +721,6 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
 
 // =====================
 // MISSED WINDOW / AUTO-ADVANCE
-//
-// Registers the missed window entry immediately (for ping tracking),
-// but the card only appears in the stack once nextWindowStart is reached.
 // =====================
 async function handleMissedWindow(boss, id, channel) {
   const e = data.kills[id];
@@ -724,14 +735,11 @@ async function handleMissedWindow(boss, id, channel) {
 
   spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
 
-  // Kill the yellow spawn window card and any warnings — the orange tracker takes over
   clearBossCards(id);
 
   const nextWindowStart = e.respawnTime;
   const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
 
-  // Register entry — card will NOT appear until nextWindowStart is reached.
-  // computeStackFingerprint() filters out entries where nextWindowStart > now.
   missedWindowMessages[id] = {
     msg:            null,
     deleteTimer:    null,
@@ -742,27 +750,20 @@ async function handleMissedWindow(boss, id, channel) {
     pinged20min:    false,
     boss,
   };
-
-  // Do NOT set lastStackFingerprint = "" here — the card isn't visible yet.
-  // The loop will naturally detect it once nextWindowStart arrives.
 }
 
-// Called every tick — keeps missed window embeds live and fires @everyone pings.
 async function tickMissedWindowMessages(channel) {
   const now = Date.now();
 
   for (const id of Object.keys(missedWindowMessages)) {
     const w = missedWindowMessages[id];
 
-    // Check if this entry just became visible (window opened this tick)
     if (w.nextWindowStart <= now && !w.msg) {
-      // Window just opened but card not posted yet — trigger a repin
       lastStackFingerprint = "";
     }
 
     if (!w.msg) continue;
 
-    // Keep embed updated
     w.msg.edit({
       embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
       components: buildMissedWindowComponents(id)
@@ -771,7 +772,6 @@ async function tickMissedWindowMessages(channel) {
     const untilStart = w.nextWindowStart - now;
     const untilEnd   = w.nextWindowEnd   - now;
 
-    // @everyone when 2h window opens (once) — single merged message
     if (!w.pingedStart && untilStart <= 0 && untilEnd > 0) {
       w.pingedStart = true;
       const tsClose = Math.floor(w.nextWindowEnd / 1000);
@@ -783,7 +783,6 @@ async function tickMissedWindowMessages(channel) {
       forwardToLogChannel(content);
     }
 
-    // @everyone at 1h remaining (once)
     if (!w.pinged1h && untilEnd > 0 && untilEnd <= 60 * 60 * 1000) {
       w.pinged1h = true;
       const content =
@@ -793,7 +792,6 @@ async function tickMissedWindowMessages(channel) {
       forwardToLogChannel(content);
     }
 
-    // @everyone at 20 min remaining (once)
     if (!w.pinged20min && untilEnd > 0 && untilEnd <= 20 * 60 * 1000) {
       w.pinged20min = true;
       const content =
@@ -921,56 +919,63 @@ function buildButtons() {
 }
 
 // =====================
-// MAIN LOOP
+// MAIN LOOP — wrapped in try/catch so one bad tick never kills the interval
 // =====================
 function startLoop() {
   setInterval(async () => {
-    if (!dashboardMessage) return;
-    const channel = dashboardMessage.channel;
+    try {
+      if (!dashboardMessage) return;
+      const channel = dashboardMessage.channel;
 
-    // STEP 1: Fingerprint check — also handles missed windows that just opened
-    await tickMissedWindowMessages(channel);  // may set lastStackFingerprint = "" when window opens
+      // STEP 1: Fingerprint check
+      await tickMissedWindowMessages(channel);
 
-    const currentFingerprint = computeStackFingerprint();
-    if (currentFingerprint !== lastStackFingerprint) {
-      await fullRepin(channel);
-      // Always fall through to warnings/events — never skip them due to a repin
+      const currentFingerprint = computeStackFingerprint();
+      if (currentFingerprint !== lastStackFingerprint) {
+        await fullRepin(channel);
+      }
+
+      // STEP 2: Fast path — all edits fired concurrently
+      await Promise.all([
+        dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
+          .catch(err => {
+            if (err.code === 10008) { dashboardMessage = null; lastStackFingerprint = ""; }
+            else if (err.status !== 503 && err.status !== 502) {
+              console.error("[Loop] Dashboard edit failed:", err.message ?? err);
+            }
+          }),
+
+        ...Object.entries(missedWindowMessages)
+          .filter(([, w]) => w.msg)
+          .map(([id, w]) =>
+            w.msg.edit({
+              embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+              components: buildMissedWindowComponents(id)
+            }).catch(err => {
+              if (err.code === 10008) { delete missedWindowMessages[id]; lastStackFingerprint = ""; }
+            })
+          ),
+
+        ...Object.entries(spawnWindowMessages)
+          .filter(([, w]) => w.msg)
+          .map(([id, w]) =>
+            w.msg.edit({
+              embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
+              components: buildSpawnWindowComponents(id)
+            }).catch(err => {
+              if (err.code === 10008) { delete spawnWindowMessages[id]; lastStackFingerprint = ""; }
+            })
+          )
+      ]);
+
+      // STEP 3: Warnings & event checks
+      checkWarnings(channel);
+      await checkFixedEvents(channel);
+
+    } catch (err) {
+      // Log the error but let the interval keep running on the next tick
+      console.error("[Loop] Tick error (recovered):", err.message ?? err);
     }
-
-    // STEP 2: Fast path — all edits fired concurrently
-    await Promise.all([
-      dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
-        .catch(err => {
-          if (err.code === 10008) { dashboardMessage = null; lastStackFingerprint = ""; }
-        }),
-
-      ...Object.entries(missedWindowMessages)
-        .filter(([, w]) => w.msg)
-        .map(([id, w]) =>
-          w.msg.edit({
-            embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
-            components: buildMissedWindowComponents(id)
-          }).catch(err => {
-            if (err.code === 10008) { delete missedWindowMessages[id]; lastStackFingerprint = ""; }
-          })
-        ),
-
-      ...Object.entries(spawnWindowMessages)
-        .filter(([, w]) => w.msg)
-        .map(([id, w]) =>
-          w.msg.edit({
-            embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
-            components: buildSpawnWindowComponents(id)
-          }).catch(err => {
-            if (err.code === 10008) { delete spawnWindowMessages[id]; lastStackFingerprint = ""; }
-          })
-        )
-    ]);
-
-    // STEP 3: Warnings & event checks
-    checkWarnings(channel);
-    await checkFixedEvents(channel);
-
   }, TICK_RATE);
 }
 
@@ -996,7 +1001,6 @@ function checkWarnings(channel) {
 
     if (cooldown > 0 && cooldown <= 5 * 60 * 1000 && !w.warned5) {
       w.warned5 = true;
-      // Skip the 5-min ping if a missed window tracker already handles this boss
       if (!missedWindowMessages[b.id]) {
         postEveryoneWarning(channel, `${b.id}_5min`, `@everyone ⏳ **${b.name}** spawns in 5 minutes`);
       }
@@ -1009,7 +1013,6 @@ function checkWarnings(channel) {
 
     if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
       w.windowCreated = true;
-      // Skip the 1h spawn window card if a missed window tracker already covers this boss
       if (!missedWindowMessages[b.id]) {
         createSpawnWindow(b, b.id, channel, windowEnd);
       }
@@ -1060,7 +1063,7 @@ client.once(Events.ClientReady, async () => {
 
   if (DATA_BACKUP_CHANNEL_ID) {
     try { await initBackupMessages(await client.channels.fetch(DATA_BACKUP_CHANNEL_ID)); }
-    catch (err) { console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID, falling back to main channel:", err); await initBackupMessages(channel); }
+    catch (err) { console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID, falling back to main channel:", err.message ?? err); await initBackupMessages(channel); }
   } else {
     await initBackupMessages(channel);
   }
@@ -1075,7 +1078,7 @@ client.once(Events.ClientReady, async () => {
   startLoop();
   startBackupLoop();
 
-  setTimeout(() => runBackup().catch(err => console.error("[Backup] Startup backup failed:", err)), 5000);
+  setTimeout(() => runBackup().catch(err => console.error("[Backup] Startup backup failed:", err.message ?? err)), 5000);
 });
 
 // =====================
