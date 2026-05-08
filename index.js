@@ -524,7 +524,14 @@ function buildEmbed() {
       const tsRespawn = Math.floor(e.respawnTime / 1000);
       text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
     } else if (windowLeft <= 0) {
-      text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${toServerDateTimeStr(e.respawnTime)} (server)\n👤 ${e.lastKiller}`;
+      const nextWindowOpen  = e.respawnTime + 60 * 60 * 1000;       // spawn window closed = earliest possible next respawn
+      const nextWindowClose = e.respawnTime + 2 * 60 * 60 * 1000;   // grace end = latest possible next respawn
+      const tsOpen  = Math.floor(nextWindowOpen / 1000);
+      const tsClose = Math.floor(nextWindowClose / 1000);
+      const nextLine = nextWindowClose > now
+        ? `🔄 Next possible: <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
+        : `🔄 Next window also passed — update manually`;
+      text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server)\n${nextLine}\n👤 ${e.lastKiller}`;
       isBroken = true;
     } else {
       const tsRespawn = Math.floor(e.respawnTime / 1000);
