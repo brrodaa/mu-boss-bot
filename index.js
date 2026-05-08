@@ -47,9 +47,6 @@ const client = new Client({
 const TICK_RATE  = 5000;
 const MAX_UNDO   = 10;
 
-// How long before we repin the full stack to the bottom of chat.
-const REPIN_AFTER_MS = 3 * 60 * 1000;
-
 // @everyone warning card: lives 10 minutes, repins itself 1 minute before expiry.
 const EVERYONE_WARNING_LIFESPAN_MS    = 10 * 60 * 1000;
 const EVERYONE_REPIN_BEFORE_EXPIRE_MS =  1 * 60 * 1000;
@@ -85,7 +82,13 @@ let backupMessages  = [];
 let backupSlotIndex = 0;
 let logMessage      = null;
 
-let lastRepinTime = Date.now();
+// The last fingerprint of the stack we posted, used to detect when a repin
+// is needed without making any API calls. Format: "missed:id1,id2|spawn:id3,id4"
+// Set to "" on startup / after any structural change to force the first repin.
+let lastStackFingerprint = "";
+
+// Guards against concurrent fullRepin() calls.
+let repinInProgress = false;
 
 // =====================
 // BOSSES
@@ -599,112 +602,150 @@ function buildMissedWindowComponents(id) {
 }
 
 // =====================
-// ATOMIC FULL REPIN
+// STACK FINGERPRINT
 //
-// Posts everything in the correct order:
-//   [dashboard] → [missed window trackers] → [active spawn windows]
-//
-// All deletions happen first, then all reposts in one atomic pass.
-// createSpawnWindow() and handleMissedWindow() must NOT call fullRepin()
-// themselves — they set lastRepinTime = 0 to let the main loop drive it.
+// A cheap string that describes exactly which cards are in the stack and
+// in what order. If it differs from lastStackFingerprint a full repin is
+// needed; otherwise we stay on the fast (edit-in-place) path.
 // =====================
-async function fullRepin(channel) {
-  // 1. Delete dashboard
-  if (dashboardMessage) {
-    await dashboardMessage.delete().catch(() => {});
-    dashboardMessage = null;
-  }
-
-  // 2. Delete all missed window cards (preserve state, just clear message refs)
-  for (const id of Object.keys(missedWindowMessages)) {
-    const w = missedWindowMessages[id];
-    clearTimeout(w.deleteTimer);
-    if (w.msg) w.msg.delete().catch(() => {});
-    w.msg         = null;
-    w.deleteTimer = null;
-  }
-
-  // 3. Delete all spawn window cards (preserve state, just clear message refs)
-  for (const id of Object.keys(spawnWindowMessages)) {
-    const w = spawnWindowMessages[id];
-    clearTimeout(w.deleteTimer);
-    if (w.msg) w.msg.delete().catch(() => {});
-    w.msg         = null;
-    w.deleteTimer = null;
-  }
-
+function computeStackFingerprint() {
   const now = Date.now();
 
-  // 4. Post dashboard
-  dashboardMessage = await channel.send({
-    embeds: [buildEmbed()],
-    components: buildButtons(),
-    flags: MessageFlags.SuppressNotifications
-  });
-  lastRepinTime = now;
-
-  // 5. Post missed window cards (soonest window-end first)
-  const missedEntries = Object.entries(missedWindowMessages)
+  const missed = Object.entries(missedWindowMessages)
     .filter(([, w]) => w.nextWindowEnd + WINDOW_GRACE_MS > now)
-    .sort(([, a], [, b]) => a.nextWindowEnd - b.nextWindowEnd);
+    .sort(([, a], [, b]) => a.nextWindowEnd - b.nextWindowEnd)
+    .map(([id]) => id);
 
-  for (const [id, w] of missedEntries) {
-    try {
-      const msg = await channel.send({
-        embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
-        components: buildMissedWindowComponents(id),
-        flags:      MessageFlags.SuppressNotifications
-      });
-      w.msg = msg;
-      const ttl     = (w.nextWindowEnd - now) + WINDOW_GRACE_MS;
-      w.deleteTimer = setTimeout(() => {
-        msg.delete().catch(() => {});
-        delete missedWindowMessages[id];
-      }, Math.max(ttl, 0));
-    } catch (err) {
-      console.error(`[Repin] Failed to repost missed window for ${id}:`, err);
-      delete missedWindowMessages[id];
-    }
-  }
-
-  // 6. Post active spawn window cards (soonest window-end first)
-  const spawnEntries = Object.entries(spawnWindowMessages)
+  const spawn = Object.entries(spawnWindowMessages)
     .filter(([, w]) => w.windowEnd + WINDOW_GRACE_MS > now)
-    .sort(([, a], [, b]) => a.windowEnd - b.windowEnd);
+    .sort(([, a], [, b]) => a.windowEnd - b.windowEnd)
+    .map(([id]) => id);
 
-  for (const [id, w] of spawnEntries) {
-    try {
-      const msg = await channel.send({
-        embeds:     [buildSpawnWindowEmbed(w.boss, w.windowEnd)],
-        components: buildSpawnWindowComponents(id),
-        flags:      MessageFlags.SuppressNotifications
-      });
-      w.msg = msg;
-      const ttl     = (w.windowEnd - now) + WINDOW_GRACE_MS;
-      w.deleteTimer = setTimeout(() => {
-        msg.delete().catch(() => {});
-        delete spawnWindowMessages[id];
-      }, Math.max(ttl, 0));
-    } catch (err) {
-      console.error(`[Repin] Failed to repost spawn window for ${id}:`, err);
-      delete spawnWindowMessages[id];
+  return `missed:${missed.join(",")}|spawn:${spawn.join(",")}`;
+}
+
+// =====================
+// ATOMIC FULL REPIN
+//
+// Posts the entire stack in one go:
+//   [dashboard] → [missed window trackers] → [active spawn windows]
+//
+// Called ONLY when the fingerprint changes or the dashboard message is gone.
+// Never call directly from createSpawnWindow / handleMissedWindow — those
+// functions just update state; the loop decides when to repin.
+// =====================
+async function fullRepin(channel) {
+  if (repinInProgress) return;
+  repinInProgress = true;
+
+  try {
+    const now = Date.now();
+
+    // ── 1. Delete all managed messages ──────────────────────────────────
+    if (dashboardMessage) {
+      await dashboardMessage.delete().catch(() => {});
+      dashboardMessage = null;
     }
-  }
 
-  console.log(`[Repin] Done — missed:[${Object.keys(missedWindowMessages).join(",")}] spawn:[${Object.keys(spawnWindowMessages).join(",")}]`);
+    for (const id of Object.keys(missedWindowMessages)) {
+      const w = missedWindowMessages[id];
+      clearTimeout(w.deleteTimer);
+      if (w.msg) w.msg.delete().catch(() => {});
+      w.msg = null; w.deleteTimer = null;
+    }
+
+    for (const id of Object.keys(spawnWindowMessages)) {
+      const w = spawnWindowMessages[id];
+      clearTimeout(w.deleteTimer);
+      if (w.msg) w.msg.delete().catch(() => {});
+      w.msg = null; w.deleteTimer = null;
+    }
+
+    // ── 2. Prune entries that are fully expired ──────────────────────────
+    for (const id of Object.keys(missedWindowMessages)) {
+      if (missedWindowMessages[id].nextWindowEnd + WINDOW_GRACE_MS <= now)
+        delete missedWindowMessages[id];
+    }
+    for (const id of Object.keys(spawnWindowMessages)) {
+      if (spawnWindowMessages[id].windowEnd + WINDOW_GRACE_MS <= now)
+        delete spawnWindowMessages[id];
+    }
+
+    // ── 3. Post dashboard ─────────────────────────────────────────────────
+    dashboardMessage = await channel.send({
+      embeds:     [buildEmbed()],
+      components: buildButtons(),
+      flags:      MessageFlags.SuppressNotifications
+    });
+
+    // ── 4. Post missed window cards (soonest window-end first) ───────────
+    const missedEntries = Object.entries(missedWindowMessages)
+      .sort(([, a], [, b]) => a.nextWindowEnd - b.nextWindowEnd);
+
+    for (const [id, w] of missedEntries) {
+      try {
+        const msg = await channel.send({
+          embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+          components: buildMissedWindowComponents(id),
+          flags:      MessageFlags.SuppressNotifications
+        });
+        w.msg = msg;
+        const ttl = (w.nextWindowEnd - now) + WINDOW_GRACE_MS;
+        w.deleteTimer = setTimeout(() => {
+          msg.delete().catch(() => {});
+          delete missedWindowMessages[id];
+          lastStackFingerprint = ""; // force repin to remove card from stack
+        }, Math.max(ttl, 0));
+      } catch (err) {
+        console.error(`[Repin] Failed to post missed window for ${id}:`, err);
+        delete missedWindowMessages[id];
+      }
+    }
+
+    // ── 5. Post active spawn window cards (soonest window-end first) ─────
+    const spawnEntries = Object.entries(spawnWindowMessages)
+      .sort(([, a], [, b]) => a.windowEnd - b.windowEnd);
+
+    for (const [id, w] of spawnEntries) {
+      try {
+        const msg = await channel.send({
+          embeds:     [buildSpawnWindowEmbed(w.boss, w.windowEnd)],
+          components: buildSpawnWindowComponents(id),
+          flags:      MessageFlags.SuppressNotifications
+        });
+        w.msg = msg;
+        const ttl = (w.windowEnd - now) + WINDOW_GRACE_MS;
+        w.deleteTimer = setTimeout(() => {
+          msg.delete().catch(() => {});
+          delete spawnWindowMessages[id];
+          lastStackFingerprint = ""; // force repin to remove card from stack
+        }, Math.max(ttl, 0));
+      } catch (err) {
+        console.error(`[Repin] Failed to post spawn window for ${id}:`, err);
+        delete spawnWindowMessages[id];
+      }
+    }
+
+    lastStackFingerprint = computeStackFingerprint();
+    console.log(`[Repin] Stack: dashboard → missed:[${Object.keys(missedWindowMessages).join(",")}] → spawn:[${Object.keys(spawnWindowMessages).join(",")}]`);
+
+  } catch (err) {
+    console.error("[Repin] Error:", err);
+  } finally {
+    repinInProgress = false;
+  }
 }
 
 // =====================
 // SPAWN WINDOW CREATION
 //
-// Registers the entry (no message yet) and signals fullRepin via lastRepinTime = 0.
+// Registers the entry (no message yet). The loop detects the fingerprint
+// change on the next tick and calls fullRepin() to post it in order.
 // =====================
 async function createSpawnWindow(boss, id, channel, windowEnd) {
   if (spawnWindowMessages[id]) return;
-  // Register placeholder — fullRepin will post it in the correct stack position.
   spawnWindowMessages[id] = { msg: null, windowEnd, boss, deleteTimer: null };
-  // Signal the main loop to repin on next tick.
-  lastRepinTime = 0;
+  lastStackFingerprint = ""; // trigger repin on next tick
 }
 
 // =====================
@@ -741,7 +782,7 @@ async function handleMissedWindow(boss, id, channel) {
   const nextWindowStart = e.respawnTime;
   const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
 
-  // Register placeholder — fullRepin will post it in the correct stack position.
+  // Register placeholder — loop detects fingerprint change and calls fullRepin().
   missedWindowMessages[id] = {
     msg:            null,
     deleteTimer:    null,
@@ -753,8 +794,7 @@ async function handleMissedWindow(boss, id, channel) {
     boss,
   };
 
-  // Signal the main loop to repin on next tick.
-  lastRepinTime = 0;
+  lastStackFingerprint = ""; // trigger repin on next tick
 }
 
 // Called every tick — keeps missed window embeds live and fires @everyone pings.
@@ -818,7 +858,9 @@ async function checkFixedEvents(channel) {
       const warnMs    = ev.warnMinutes * 60 * 1000;
       const timeUntil = eventMs - now;
 
-      if (timeUntil > warnMs || timeUntil < 0) continue;
+      // Fire if we're within the warn window, with a one-tick buffer on each
+      // side so a tick landing slightly late or early never misses the ping.
+      if (timeUntil > warnMs + TICK_RATE || timeUntil < -TICK_RATE) continue;
 
       const eventDate = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
       const key       = `${ev.name}|${hhmm}|${eventDate}`;
@@ -931,9 +973,13 @@ function buildButtons() {
 // =====================
 // MAIN LOOP
 //
-// Every tick:
-//   STEP 1 — Check if a full repin is needed (order change or dashboard gone).
-//   STEP 2 — Fast path: edit all messages in-place concurrently.
+// Every tick (5 s):
+//   STEP 1 — Compute current stack fingerprint.
+//             If it differs from the last posted fingerprint (or dashboard
+//             is null), run fullRepin() and return — no edits needed.
+//   STEP 2 — Fast path: edit all messages concurrently in-place.
+//             All sends happen in a single Promise.all so Discord receives
+//             them as close together as possible — no jiggle.
 //   STEP 3 — Fire warnings, missed-window ticks, fixed event checks.
 // =====================
 function startLoop() {
@@ -941,11 +987,9 @@ function startLoop() {
     if (!dashboardMessage) return;
     const channel = dashboardMessage.channel;
 
-    // ── STEP 1: Decide if a full repin is needed ──────────────────────────
-    const repinDue      = Date.now() - lastRepinTime >= REPIN_AFTER_MS;
-    const dashboardDead = await dashboardMessage.fetch().then(() => false).catch(() => true);
-
-    if (repinDue || dashboardDead || lastRepinTime === 0) {
+    // ── STEP 1: Fingerprint check (zero API calls) ────────────────────────
+    const currentFingerprint = computeStackFingerprint();
+    if (currentFingerprint !== lastStackFingerprint) {
       await fullRepin(channel);
       checkWarnings(channel);
       await tickMissedWindowMessages(channel);
@@ -953,9 +997,13 @@ function startLoop() {
       return;
     }
 
-    // ── STEP 2: Fast path — edit all messages concurrently ────────────────
+    // ── STEP 2: Fast path — all edits fired concurrently ─────────────────
     await Promise.all([
-      dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() }).catch(() => {}),
+      dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
+        .catch(err => {
+          // Dashboard was manually deleted — force a repin next tick.
+          if (err.code === 10008) { dashboardMessage = null; lastStackFingerprint = ""; }
+        }),
 
       ...Object.entries(missedWindowMessages)
         .filter(([, w]) => w.msg)
@@ -964,7 +1012,7 @@ function startLoop() {
             embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
             components: buildMissedWindowComponents(id)
           }).catch(err => {
-            if (err.code === 10008) { delete missedWindowMessages[id]; lastRepinTime = 0; }
+            if (err.code === 10008) { delete missedWindowMessages[id]; lastStackFingerprint = ""; }
           })
         ),
 
@@ -975,12 +1023,12 @@ function startLoop() {
             embeds:     [buildSpawnWindowEmbed(w.boss, w.windowEnd)],
             components: buildSpawnWindowComponents(id)
           }).catch(err => {
-            if (err.code === 10008) { delete spawnWindowMessages[id]; lastRepinTime = 0; }
+            if (err.code === 10008) { delete spawnWindowMessages[id]; lastStackFingerprint = ""; }
           })
         )
     ]);
 
-    // ── STEP 3: Warnings & event checks ──────────────────────────────────
+    // ── STEP 3: Warnings & event checks ───────────────────────────────────
     checkWarnings(channel);
     await tickMissedWindowMessages(channel);
     await checkFixedEvents(channel);
@@ -1086,7 +1134,7 @@ client.once(Events.ClientReady, async () => {
     components: buildButtons(),
     flags: MessageFlags.SuppressNotifications
   });
-  lastRepinTime = Date.now();
+  lastStackFingerprint = computeStackFingerprint(); // mark stack as freshly posted
 
   startLoop();
   startBackupLoop();
