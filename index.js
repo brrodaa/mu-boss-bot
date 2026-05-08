@@ -1107,7 +1107,8 @@ client.on(Events.InteractionCreate, async interaction => {
       `🕒 Kill: ${toServerDateTimeStr(kill.getTime())} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`
     );
 
-    return interaction.deferUpdate();
+    await repinDashboard(interaction.channel);
+    return interaction.reply({ content: "✅ Kill time set!", flags: MessageFlags.Ephemeral });
   }
 
   // =====================
@@ -1183,7 +1184,8 @@ client.on(Events.InteractionCreate, async interaction => {
       `🕒 Kill: ${toServerDateTimeStr(kill.getTime())} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`
     );
 
-    return interaction.deferUpdate();
+    await repinDashboard(interaction.channel);
+    return interaction.reply({ content: "✅ Kill time set!", flags: MessageFlags.Ephemeral });
   }
 
   // =====================
@@ -1251,7 +1253,8 @@ client.on(Events.InteractionCreate, async interaction => {
       `🕒 Kill: ${toServerDateTimeStr(kill.getTime())} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`
     );
 
-    return interaction.deferUpdate();
+    await repinDashboard(interaction.channel);
+    return interaction.reply({ content: "✅ Kill time set!", flags: MessageFlags.Ephemeral });
   }
 
   // =====================
