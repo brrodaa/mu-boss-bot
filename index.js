@@ -138,6 +138,21 @@ const FIXED_EVENTS = [
     warnMinutes: 10,
     extraNote: "⚠️ Registration opens **5 minutes before** the event starts — be ready!",
   },
+  {
+    name: "🐇 Lunar Rabbit",
+    times: ["05:25","11:25","17:25","23:25"],
+    warnMinutes: 5,
+  },
+  {
+    name: "🔥 Fire Flame",
+    times: ["01:25","07:25","13:25","19:25"],
+    warnMinutes: 5,
+  },
+  {
+    name: "🎁 Pouch of Blessing",
+    times: ["03:25","09:25","15:25","21:25"],
+    warnMinutes: 5,
+  },
 ];
 
 const eventPingedKeys = new Set();
