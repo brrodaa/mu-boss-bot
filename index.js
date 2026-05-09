@@ -32,14 +32,13 @@ const fs   = require("fs");
 const path = require("path");
 
 const TOKEN          = process.env.BOT_TOKEN;
-const CHANNEL_ID     = process.env.CHANNEL_ID;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
+const CHANNEL_ID     = "1502646350410416128";
+const LOG_CHANNEL_ID = "1502646498670674080";
 
-if (!TOKEN || !CHANNEL_ID) {
-  console.error("ERROR: Missing BOT_TOKEN or CHANNEL_ID environment variables.");
+if (!TOKEN) {
+  console.error("ERROR: Missing BOT_TOKEN environment variable.");
   process.exit(1);
 }
-if (!LOG_CHANNEL_ID) console.warn("[Warn] LOG_CHANNEL_ID not set — backups and log forwarding disabled.");
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
@@ -48,7 +47,8 @@ const client = new Client({
 // =====================
 // SETTINGS
 // =====================
-const TICK_RATE  = 5000;
+const TICK_RATE  = 15000; // 15 seconds — reduced from 5s to ease API pressure
+
 const MAX_UNDO   = 10;
 
 const EVERYONE_WARNING_LIFESPAN_MS    = 10 * 60 * 1000;
@@ -70,8 +70,15 @@ let everyoneWarnings     = {};
 let adminLogs = [];
 let undoStack = [];
 
-let backupMessage   = null; // single Discord backup message, edited hourly, reposted every 12h
+let backupMessage   = null;
 let logMessage      = null;
+
+// ── Repin lock — prevents concurrent repins from stomping each other ──
+let repinInProgress = false;
+
+// ── Backup repost throttle — prevents interaction spam from causing message chaos ──
+let lastBackupRepost = 0;
+const BACKUP_REPOST_COOLDOWN_MS = 60 * 1000;
 
 const BOT_START_TIME   = Date.now();
 const STARTUP_GRACE_MS = 30 * 1000;
@@ -193,8 +200,6 @@ function save() {
 // REDEPLOY RECOVERY
 // =====================
 async function recoverFromDiscordBackup() {
-  if (!LOG_CHANNEL_ID) return false;
-
   const now = Date.now();
   const localEmpty =
     !fs.existsSync("data.json") ||
@@ -265,8 +270,6 @@ function saveLocalBackup() {
 
 // =====================
 // BACKUP — Discord single message
-// Edited in place every hour. Reposted to bottom of LOG_CHANNEL_ID every 12h
-// so it stays findable without spamming the channel.
 // =====================
 function buildBackupEmbed(takenAt) {
   const stamp = toServerDateTimeStr(takenAt || Date.now());
@@ -288,7 +291,6 @@ function buildBackupFile() {
 }
 
 async function initBackupMessage(backupChannel) {
-  // Try to find an existing backup message to reuse
   try {
     const existing = await backupChannel.messages.fetch({ limit: 50 });
     const found = [...existing.values()].find(m =>
@@ -305,7 +307,6 @@ async function initBackupMessage(backupChannel) {
     console.warn("[Backup] Could not scan for existing backup message:", err.message ?? err);
   }
 
-  // Post a fresh one
   backupMessage = await backupChannel.send({
     embeds: [buildBackupEmbed(null)],
     files:  [buildBackupFile()],
@@ -327,16 +328,14 @@ async function updateDiscordBackup() {
       console.warn(`[Backup] Discord temporarily unavailable (${err.status}), will retry next cycle`);
     } else {
       console.error(`[Backup] Edit failed: ${err.status} ${err.message}`);
-      backupMessage = null; // will be recreated on next repost cycle
+      backupMessage = null;
     }
   }
 }
 
 async function repostBackupToBottom() {
-  if (!LOG_CHANNEL_ID) return;
   try {
     const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
-    // Delete old backup message if we have a reference to it
     if (backupMessage) backupMessage.delete().catch(() => {});
     backupMessage = await logCh.send({
       embeds: [buildBackupEmbed(Date.now())],
@@ -432,15 +431,11 @@ function undo() {
 // =====================
 // ANNOUNCE HELPERS
 // =====================
-
-// Strip @everyone and @here before archiving so the log channel
-// doesn't ping anyone when the message is forwarded.
 function stripPings(content) {
   return content.replace(/@everyone/g, "everyone").replace(/@here/g, "here");
 }
 
 async function forwardToLogChannel(content) {
-  if (!LOG_CHANNEL_ID) return;
   if (LOG_CHANNEL_ID === CHANNEL_ID) return;
   try {
     const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
@@ -451,7 +446,6 @@ async function forwardToLogChannel(content) {
 async function announceKill(channel, user, action, extra = "") {
   const content = `⚔️ **${user.username}** ${action} — ${toServerDateTimeStr(Date.now())} (server time)${extra ? `\n${extra}` : ""}`;
   const msg = await channel.send({ content, flags: MessageFlags.SuppressNotifications });
-  // After 5 min: delete from tracker channel, then archive (stripped) to log channel
   setTimeout(() => {
     msg.delete().catch(() => {});
     forwardToLogChannel(stripPings(content));
@@ -588,7 +582,7 @@ function buildEmbed() {
   const embed = new EmbedBuilder()
     .setTitle("🔥 LIVE MU TRACKER")
     .setColor(0xffaa00)
-    .setFooter({ text: "Auto-updates every 5s" });
+    .setFooter({ text: "Auto-updates every 15s" });
 
   const bosses = BOSSES.map(b => {
     const e = data.kills[b.id];
@@ -664,70 +658,77 @@ function buildButtons() {
 
 // =====================
 // REPIN DASHBOARD
-// Non-destructive: post new messages first, then delete old ones.
-// No lock needed — simple enough to be safe.
+// Guarded by repinInProgress lock to prevent concurrent repins.
 // =====================
 async function repinDashboard(channel) {
-  const now = Date.now();
+  if (repinInProgress) {
+    console.log("[Repin] Already in progress, skipping.");
+    return;
+  }
+  repinInProgress = true;
 
-  // 1. Post new dashboard first (never leaves a gap)
-  const newDashboard = await channel.send({
-    embeds:     [buildEmbed()],
-    components: buildButtons(),
-    flags:      MessageFlags.SuppressNotifications
-  }).catch(err => { console.error("[Repin] Failed to post dashboard:", err.message ?? err); return null; });
+  try {
+    const now = Date.now();
 
-  if (!newDashboard) return;
+    // 1. Post new dashboard first (never leaves a gap)
+    const newDashboard = await channel.send({
+      embeds:     [buildEmbed()],
+      components: buildButtons(),
+      flags:      MessageFlags.SuppressNotifications
+    }).catch(err => { console.error("[Repin] Failed to post dashboard:", err.message ?? err); return null; });
 
-  // 2. Delete old dashboard after new one is live
-  if (dashboardMessage) dashboardMessage.delete().catch(() => {});
-  dashboardMessage = newDashboard;
+    if (!newDashboard) return;
 
-  // 3. Repost spawn window messages below the new dashboard
-  for (const id of Object.keys(spawnWindowMessages)) {
-    const w = spawnWindowMessages[id];
-    if (w.msg) w.msg.delete().catch(() => {});
+    // 2. Delete old dashboard after new one is live
+    if (dashboardMessage) dashboardMessage.delete().catch(() => {});
+    dashboardMessage = newDashboard;
 
-    // Only repost if window is still active
-    if (w.windowEnd + WINDOW_GRACE_MS > now) {
+    // 3. Repost spawn window messages below the new dashboard
+    for (const id of Object.keys(spawnWindowMessages)) {
+      const w = spawnWindowMessages[id];
+      if (w.msg) w.msg.delete().catch(() => {});
+
+      if (w.windowEnd + WINDOW_GRACE_MS > now) {
+        const newMsg = await channel.send({
+          embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
+          components: buildSpawnWindowComponents(id),
+          flags:      MessageFlags.SuppressNotifications
+        }).catch(() => null);
+        w.msg = newMsg;
+      } else {
+        delete spawnWindowMessages[id];
+      }
+    }
+
+    // 4. Repost missed window messages below spawn windows
+    for (const id of Object.keys(missedWindowMessages)) {
+      const w = missedWindowMessages[id];
+
+      if (w.nextWindowStart > now) {
+        if (w.msg) { w.msg.delete().catch(() => {}); w.msg = null; }
+        continue;
+      }
+
+      if (w.nextWindowEnd + WINDOW_GRACE_MS <= now) {
+        if (w.msg) w.msg.delete().catch(() => {});
+        delete missedWindowMessages[id];
+        continue;
+      }
+
+      if (w.msg) w.msg.delete().catch(() => {});
+
       const newMsg = await channel.send({
-        embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
-        components: buildSpawnWindowComponents(id),
+        embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+        components: buildMissedWindowComponents(id),
         flags:      MessageFlags.SuppressNotifications
       }).catch(() => null);
       w.msg = newMsg;
-    } else {
-      delete spawnWindowMessages[id];
     }
+
+    console.log("[Repin] Dashboard stack refreshed.");
+  } finally {
+    repinInProgress = false;
   }
-
-  // 4. Repost missed window messages below spawn windows
-  for (const id of Object.keys(missedWindowMessages)) {
-    const w = missedWindowMessages[id];
-
-    // Only show if window has already started
-    if (w.nextWindowStart > now) {
-      if (w.msg) { w.msg.delete().catch(() => {}); w.msg = null; }
-      continue;
-    }
-
-    if (w.nextWindowEnd + WINDOW_GRACE_MS <= now) {
-      if (w.msg) w.msg.delete().catch(() => {});
-      delete missedWindowMessages[id];
-      continue;
-    }
-
-    if (w.msg) w.msg.delete().catch(() => {});
-
-    const newMsg = await channel.send({
-      embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
-      components: buildMissedWindowComponents(id),
-      flags:      MessageFlags.SuppressNotifications
-    }).catch(() => null);
-    w.msg = newMsg;
-  }
-
-  console.log("[Repin] Dashboard stack refreshed.");
 }
 
 // =====================
@@ -787,10 +788,10 @@ async function handleMissedWindow(boss, id, channel) {
 }
 
 // =====================
-// MAIN LOOP — single loop, single responsibility
+// MAIN LOOP
 // Edits messages in place every tick.
 // Only repins if the dashboard was deleted externally (error 10008).
-// No fingerprint logic, no repin lock, no time/interaction triggers.
+// Repin is guarded by a lock to prevent concurrent runs.
 // =====================
 function startLoop() {
   setInterval(async () => {
@@ -805,51 +806,54 @@ function startLoop() {
 
       // ── Repin only if dashboard was deleted externally ──
       if (!dashboardMessage) {
-        await repinDashboard(channel);
+        if (!repinInProgress) {
+          repinDashboard(channel); // intentionally not awaited — lock handles concurrency
+        }
         checkWarnings(channel);
         await checkFixedEvents(channel);
         return;
       }
 
       // ── In-place edits (cheap, no chat spam) ──
-      await Promise.all([
-        // Dashboard
-        dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
-          .catch(err => {
-            if (err.code === 10008) {
-              // Message was deleted externally — trigger repin on next tick
-              dashboardMessage = null;
-            } else if (err.status !== 503 && err.status !== 502) {
-              console.error("[Loop] Dashboard edit failed:", err.message ?? err);
-            }
-          }),
+      // Run sequentially rather than Promise.all so one failure doesn't cancel others
+      try {
+        await dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() });
+      } catch (err) {
+        if (err.code === 10008) {
+          console.warn("[Loop] Dashboard message was deleted — will repin next tick.");
+          dashboardMessage = null;
+        } else if (err.status !== 503 && err.status !== 502) {
+          console.error("[Loop] Dashboard edit failed:", err.code, err.message);
+          // Force repin on unknown persistent errors (but not permission errors)
+          if (err.code !== 50013) dashboardMessage = null;
+        }
+      }
 
-        // Spawn window messages
-        ...Object.entries(spawnWindowMessages)
-          .filter(([, w]) => w.msg)
-          .map(([id, w]) =>
-            w.msg.edit({
-              embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
-              components: buildSpawnWindowComponents(id)
-            }).catch(err => {
-              if (err.code === 10008) delete spawnWindowMessages[id];
-            })
-          ),
+      for (const [id, w] of Object.entries(spawnWindowMessages)) {
+        if (!w.msg) continue;
+        try {
+          await w.msg.edit({
+            embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
+            components: buildSpawnWindowComponents(id)
+          });
+        } catch (err) {
+          if (err.code === 10008) delete spawnWindowMessages[id];
+        }
+      }
 
-        // Missed window messages
-        ...Object.entries(missedWindowMessages)
-          .filter(([, w]) => w.msg)
-          .map(([id, w]) =>
-            w.msg.edit({
-              embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
-              components: buildMissedWindowComponents(id)
-            }).catch(err => {
-              if (err.code === 10008) delete missedWindowMessages[id];
-            })
-          )
-      ]);
+      for (const [id, w] of Object.entries(missedWindowMessages)) {
+        if (!w.msg) continue;
+        try {
+          await w.msg.edit({
+            embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+            components: buildMissedWindowComponents(id)
+          });
+        } catch (err) {
+          if (err.code === 10008) delete missedWindowMessages[id];
+        }
+      }
 
-      // ── Missed window pings (run every tick, guarded by flags) ──
+      // ── Missed window pings ──
       tickMissedWindowPings(channel, now);
 
       // ── Boss warnings & fixed events ──
@@ -864,8 +868,6 @@ function startLoop() {
 
 // =====================
 // MISSED WINDOW PINGS
-// Separated from the main loop purely to keep it readable.
-// Only sends @everyone messages — no message creation here.
 // =====================
 function tickMissedWindowPings(channel, now) {
   for (const id of Object.keys(missedWindowMessages)) {
@@ -873,9 +875,7 @@ function tickMissedWindowPings(channel, now) {
     const untilStart = w.nextWindowStart - now;
     const untilEnd   = w.nextWindowEnd   - now;
 
-    // Window just opened — post the missed card if it doesn't exist yet
     if (untilStart <= 0 && !w.msg && untilEnd + WINDOW_GRACE_MS > 0) {
-      // Post it directly so it appears without needing a full repin
       channel.send({
         embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
         components: buildMissedWindowComponents(id),
@@ -932,7 +932,6 @@ function checkWarnings(channel) {
 
     const w = spawnWarnings[b.id];
 
-    // 5 min warning — lifespan = cooldown remaining so it self-deletes as window opens
     if (cooldown > 0 && cooldown <= 5 * 60 * 1000 && !w.warned5) {
       w.warned5 = true;
       if (!missedWindowMessages[b.id]) {
@@ -940,7 +939,6 @@ function checkWarnings(channel) {
       }
     }
 
-    // Window opened — create spawn window card
     if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
       w.windowCreated = true;
       clearEveryoneWarning(`${b.id}_5min`);
@@ -949,13 +947,11 @@ function checkWarnings(channel) {
       }
     }
 
-    // 20 min remaining in window
     if (cooldown <= 0 && windowLeft > 0 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
       w.warned20 = true;
       postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** spawn window closes in 20 minutes!`);
     }
 
-    // Missed window — auto-advance timer (tracked bosses only)
     if (
       TRACKED_BOSS_TYPES.has(b.type) &&
       timeSinceWindowExpired >= 10 * 60 * 1000 &&
@@ -1042,11 +1038,10 @@ client.once(Events.ClientReady, async () => {
 
   await initLogMessage(channel);
 
-  if (LOG_CHANNEL_ID) {
-    try { await initBackupMessage(await client.channels.fetch(LOG_CHANNEL_ID)); }
-    catch (err) { console.error("[Backup] Could not init backup message in log channel:", err.message ?? err); }
-  } else {
-    console.warn("[Backup] LOG_CHANNEL_ID not set — Discord backup disabled.");
+  try {
+    await initBackupMessage(await client.channels.fetch(LOG_CHANNEL_ID));
+  } catch (err) {
+    console.error("[Backup] Could not init backup message in log channel:", err.message ?? err);
   }
 
   dashboardMessage = await channel.send({
@@ -1067,8 +1062,11 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
 
-  // Repost backup to bottom of log channel on every interaction so it stays live
-  repostBackupToBottom();
+  // ── Throttled backup repost — at most once per minute ──
+  if (Date.now() - lastBackupRepost > BACKUP_REPOST_COOLDOWN_MS) {
+    lastBackupRepost = Date.now();
+    repostBackupToBottom();
+  }
 
   // ── KILL BUTTON ──
   if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
