@@ -31,17 +31,15 @@ const {
 const fs   = require("fs");
 const path = require("path");
 
-const TOKEN                  = process.env.BOT_TOKEN;
-const CHANNEL_ID             = process.env.CHANNEL_ID;
-const LOG_CHANNEL_ID         = process.env.LOG_CHANNEL_ID;
-const DATA_BACKUP_CHANNEL_ID = process.env.DATA_BACKUP_CHANNEL_ID;
+const TOKEN          = process.env.BOT_TOKEN;
+const CHANNEL_ID     = process.env.CHANNEL_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 
 if (!TOKEN || !CHANNEL_ID) {
   console.error("ERROR: Missing BOT_TOKEN or CHANNEL_ID environment variables.");
   process.exit(1);
 }
-if (!LOG_CHANNEL_ID)         console.warn("[Warn] LOG_CHANNEL_ID not set.");
-if (!DATA_BACKUP_CHANNEL_ID) console.warn("[Warn] DATA_BACKUP_CHANNEL_ID not set.");
+if (!LOG_CHANNEL_ID) console.warn("[Warn] LOG_CHANNEL_ID not set — backups and log forwarding disabled.");
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
@@ -72,9 +70,7 @@ let everyoneWarnings     = {};
 let adminLogs = [];
 let undoStack = [];
 
-const MAX_DISCORD_BACKUPS = 7;
-let backupMessages  = [];
-let backupSlotIndex = 0;
+let backupMessage   = null; // single Discord backup message, edited hourly, reposted every 12h
 let logMessage      = null;
 
 const BOT_START_TIME   = Date.now();
@@ -197,7 +193,7 @@ function save() {
 // REDEPLOY RECOVERY
 // =====================
 async function recoverFromDiscordBackup() {
-  if (!DATA_BACKUP_CHANNEL_ID) return false;
+  if (!LOG_CHANNEL_ID) return false;
 
   const now = Date.now();
   const localEmpty =
@@ -216,7 +212,7 @@ async function recoverFromDiscordBackup() {
 
   console.log("[Recovery] Local data is absent/empty/stale — scanning Discord for latest backup...");
   try {
-    const backupCh   = await client.channels.fetch(DATA_BACKUP_CHANNEL_ID);
+    const backupCh   = await client.channels.fetch(LOG_CHANNEL_ID);
     const fetched    = await backupCh.messages.fetch({ limit: 100 });
     const candidates = [...fetched.values()].filter(m =>
       m.author.id === client.user.id &&
@@ -268,9 +264,11 @@ function saveLocalBackup() {
 }
 
 // =====================
-// BACKUP — Discord persistent slots
+// BACKUP — Discord single message
+// Edited in place every hour. Reposted to bottom of LOG_CHANNEL_ID every 12h
+// so it stays findable without spamming the channel.
 // =====================
-function buildBackupEmbed(slotNumber, takenAt) {
+function buildBackupEmbed(takenAt) {
   const stamp = toServerDateTimeStr(takenAt || Date.now());
   const lines = BOSSES.map(b => {
     const e = data.kills[b.id];
@@ -278,81 +276,97 @@ function buildBackupEmbed(slotNumber, takenAt) {
     return `• **${b.name}**: by ${e.lastKiller} — kill: ${toServerDateTimeStr(e.killTime)} — respawn: ${toServerDateTimeStr(e.respawnTime)}`;
   });
   return new EmbedBuilder()
-    .setTitle(`💾 Backup Slot ${slotNumber} / ${MAX_DISCORD_BACKUPS}`)
+    .setTitle("💾 Timer Backup")
     .setColor(0x2b2d31)
     .setDescription(lines.join("\n"))
     .setFooter({ text: `Last updated: ${stamp} (server time)` });
 }
 
-async function initBackupMessages(backupChannel) {
-  backupMessages  = [];
-  backupSlotIndex = 0;
-
-  try {
-    const existing = await backupChannel.messages.fetch({ limit: 50 });
-    const botSlots = [...existing.values()]
-      .filter(m =>
-        m.author.id === client.user.id &&
-        m.embeds.length > 0 &&
-        m.embeds[0]?.title?.startsWith("💾 Backup Slot")
-      )
-      .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-    if (botSlots.length === MAX_DISCORD_BACKUPS) {
-      backupMessages  = botSlots;
-      backupSlotIndex = 0;
-      console.log(`[Backup] Reusing ${MAX_DISCORD_BACKUPS} existing backup slot messages — no data overwrite.`);
-      return;
-    }
-    console.log(`[Backup] Found ${botSlots.length}/${MAX_DISCORD_BACKUPS} existing slots — posting fresh set.`);
-  } catch (err) {
-    console.warn("[Backup] Could not fetch existing backup messages — posting fresh set.", err);
-  }
-
-  for (let i = 1; i <= MAX_DISCORD_BACKUPS; i++) {
-    const isoStamp = new Date().toISOString().replace(/:/g, "-").slice(0, 16);
-    const msg = await backupChannel.send({
-      embeds: [buildBackupEmbed(i, null)],
-      files:  [{ attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-slot${i}-${isoStamp}.json` }],
-      flags:  MessageFlags.SuppressNotifications
-    });
-    backupMessages.push(msg);
-  }
-  console.log(`[Backup] ${MAX_DISCORD_BACKUPS} fresh backup slots posted.`);
+function buildBackupFile() {
+  const isoStamp = new Date().toISOString().replace(/:/g, "-").slice(0, 16);
+  return { attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-${isoStamp}.json` };
 }
 
-async function updateDiscordBackupSlot() {
-  if (!backupMessages.length) return;
-  const slot       = backupSlotIndex % MAX_DISCORD_BACKUPS;
-  const slotNumber = slot + 1;
-  const isoStamp   = new Date().toISOString().replace(/:/g, "-").slice(0, 16);
+async function initBackupMessage(backupChannel) {
+  // Try to find an existing backup message to reuse
   try {
-    await backupMessages[slot].edit({
-      embeds: [buildBackupEmbed(slotNumber, Date.now())],
-      files:  [{ attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-slot${slotNumber}-${isoStamp}.json` }]
+    const existing = await backupChannel.messages.fetch({ limit: 50 });
+    const found = [...existing.values()].find(m =>
+      m.author.id === client.user.id &&
+      m.embeds.length > 0 &&
+      m.embeds[0]?.title === "💾 Timer Backup"
+    );
+    if (found) {
+      backupMessage = found;
+      console.log("[Backup] Reusing existing backup message.");
+      return;
+    }
+  } catch (err) {
+    console.warn("[Backup] Could not scan for existing backup message:", err.message ?? err);
+  }
+
+  // Post a fresh one
+  backupMessage = await backupChannel.send({
+    embeds: [buildBackupEmbed(null)],
+    files:  [buildBackupFile()],
+    flags:  MessageFlags.SuppressNotifications
+  });
+  console.log("[Backup] Fresh backup message posted.");
+}
+
+async function updateDiscordBackup() {
+  if (!backupMessage) return;
+  try {
+    await backupMessage.edit({
+      embeds: [buildBackupEmbed(Date.now())],
+      files:  [buildBackupFile()]
     });
-    console.log(`[Backup] Slot ${slotNumber} updated.`);
+    console.log("[Backup] Message updated.");
   } catch (err) {
     if (err.status === 503 || err.status === 502) {
-      console.warn(`[Backup] Slot ${slotNumber} — Discord temporarily unavailable (${err.status}), will retry next cycle`);
+      console.warn(`[Backup] Discord temporarily unavailable (${err.status}), will retry next cycle`);
     } else {
-      console.error(`[Backup] Slot ${slotNumber} edit failed: ${err.status} ${err.message}`);
+      console.error(`[Backup] Edit failed: ${err.status} ${err.message}`);
+      backupMessage = null; // will be recreated on next repost cycle
     }
   }
-  backupSlotIndex = (backupSlotIndex + 1) % MAX_DISCORD_BACKUPS;
+}
+
+async function repostBackupToBottom() {
+  if (!LOG_CHANNEL_ID) return;
+  try {
+    const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
+    // Delete old backup message if we have a reference to it
+    if (backupMessage) backupMessage.delete().catch(() => {});
+    backupMessage = await logCh.send({
+      embeds: [buildBackupEmbed(Date.now())],
+      files:  [buildBackupFile()],
+      flags:  MessageFlags.SuppressNotifications
+    });
+    console.log("[Backup] Reposted to bottom of log channel.");
+  } catch (err) {
+    console.error("[Backup] Repost failed:", err.message ?? err);
+  }
 }
 
 async function runBackup() {
-  try { console.log(`[Backup] ${saveLocalBackup()}`); await updateDiscordBackupSlot(); }
-  catch (err) { console.error("[Backup]", err.message ?? err); }
+  try {
+    console.log(`[Backup] ${saveLocalBackup()}`);
+    await updateDiscordBackup();
+  } catch (err) { console.error("[Backup]", err.message ?? err); }
 }
 
 function startBackupLoop() {
   const now = new Date();
   const msUntilNextHour = BACKUP_INTERVAL_MS -
     (now.getMinutes() * 60000 + now.getSeconds() * 1000 + now.getMilliseconds());
-  console.log(`[Backup] First in ${Math.round(msUntilNextHour / 60000)}m, then hourly.`);
-  setTimeout(() => { runBackup(); setInterval(runBackup, BACKUP_INTERVAL_MS); }, msUntilNextHour);
+
+  console.log(`[Backup] First hourly update in ${Math.round(msUntilNextHour / 60000)}m.`);
+
+  setTimeout(() => {
+    runBackup();
+    setInterval(runBackup, BACKUP_INTERVAL_MS);
+  }, msUntilNextHour);
 }
 
 // =====================
@@ -1028,11 +1042,11 @@ client.once(Events.ClientReady, async () => {
 
   await initLogMessage(channel);
 
-  if (DATA_BACKUP_CHANNEL_ID) {
-    try { await initBackupMessages(await client.channels.fetch(DATA_BACKUP_CHANNEL_ID)); }
-    catch (err) { console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID:", err.message ?? err); await initBackupMessages(channel); }
+  if (LOG_CHANNEL_ID) {
+    try { await initBackupMessage(await client.channels.fetch(LOG_CHANNEL_ID)); }
+    catch (err) { console.error("[Backup] Could not init backup message in log channel:", err.message ?? err); }
   } else {
-    await initBackupMessages(channel);
+    console.warn("[Backup] LOG_CHANNEL_ID not set — Discord backup disabled.");
   }
 
   dashboardMessage = await channel.send({
@@ -1052,6 +1066,9 @@ client.once(Events.ClientReady, async () => {
 // =====================
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
+
+  // Repost backup to bottom of log channel on every interaction so it stays live
+  repostBackupToBottom();
 
   // ── KILL BUTTON ──
   if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
