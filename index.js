@@ -53,6 +53,10 @@ const client = new Client({
 const TICK_RATE  = 5000;
 const MAX_UNDO   = 10;
 
+// Repin triggers (simple, like old bot — no fingerprint logic)
+const REPIN_AFTER_INTERACTIONS = 5;
+const REPIN_AFTER_MS           = 2 * 60 * 1000;
+
 const EVERYONE_WARNING_LIFESPAN_MS    = 10 * 60 * 1000;
 const EVERYONE_REPIN_BEFORE_EXPIRE_MS =  1 * 60 * 1000;
 
@@ -72,15 +76,13 @@ let everyoneWarnings     = {};
 let adminLogs = [];
 let undoStack = [];
 
+let interactionCount = 0;
+let lastRepinTime    = Date.now();
+
 const MAX_DISCORD_BACKUPS = 7;
 let backupMessages  = [];
 let backupSlotIndex = 0;
 let logMessage      = null;
-
-let lastStackFingerprint = "";
-let repinInProgress      = false;
-// FIX: safety timeout handle so repinInProgress can never stay stuck forever
-let repinTimeoutHandle   = null;
 
 const BOT_START_TIME   = Date.now();
 const STARTUP_GRACE_MS = 30 * 1000;
@@ -460,10 +462,6 @@ async function postEveryoneWarning(channel, key, content, lifespanMs = EVERYONE_
 }
 
 function scheduleEveryoneWarningCycle(channel, key, content, msg, lifespanMs = EVERYONE_WARNING_LIFESPAN_MS) {
-  // Only schedule a repin if there is enough time left before expiry.
-  // If lifespanMs <= EVERYONE_REPIN_BEFORE_EXPIRE_MS (e.g. the 5-min warning
-  // with a 5-min lifespan), repinDelay would be zero or negative, so we skip
-  // the repin entirely and just let the message delete itself on expiry.
   const repinDelay = lifespanMs - EVERYONE_REPIN_BEFORE_EXPIRE_MS;
 
   const repinTimer = repinDelay > 0 ? setTimeout(async () => {
@@ -562,134 +560,155 @@ function buildMissedWindowComponents(id) {
 }
 
 // =====================
-// STACK FINGERPRINT
+// DASHBOARD EMBED
 // =====================
-function computeStackFingerprint() {
-  const now = Date.now();
+function buildEmbed() {
+  const now   = Date.now();
+  const embed = new EmbedBuilder()
+    .setTitle("🔥 LIVE MU TRACKER")
+    .setColor(0xffaa00)
+    .setFooter({ text: "Auto-updates every 5s" });
 
-  const missed = Object.entries(missedWindowMessages)
-    .filter(([, w]) => w.nextWindowStart <= now && w.nextWindowEnd + WINDOW_GRACE_MS > now)
-    .sort(([, a], [, b]) => a.nextWindowEnd - b.nextWindowEnd)
-    .map(([id]) => id);
+  const bosses = BOSSES.map(b => {
+    const e = data.kills[b.id];
+    if (!e) return { name: b.name, timeLeft: 0, text: "🟢 READY\n👤 None", isBroken: false };
 
-  const spawn = Object.entries(spawnWindowMessages)
-    .filter(([, w]) => w.windowEnd + WINDOW_GRACE_MS > now)
-    .sort(([, a], [, b]) => a.windowEnd - b.windowEnd)
-    .map(([id]) => id);
+    const cooldown   = e.respawnTime - now;
+    const windowEnd  = e.respawnTime + 60 * 60 * 1000;
+    const windowLeft = windowEnd - now;
+    let text, isBroken = false;
 
-  return `missed:${missed.join(",")}|spawn:${spawn.join(",")}`;
+    if (cooldown > 0) {
+      const tsRespawn = Math.floor(e.respawnTime / 1000);
+      text = `🔴 ${format(cooldown)}\n🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
+    } else if (windowLeft > 0) {
+      const tsRespawn = Math.floor(e.respawnTime / 1000);
+      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
+    } else {
+      const nextWindowOpen  = e.respawnTime + 60 * 60 * 1000;
+      const nextWindowClose = e.respawnTime + 2 * 60 * 60 * 1000;
+      const tsRespawn = Math.floor(e.respawnTime    / 1000);
+      const tsOpen    = Math.floor(nextWindowOpen   / 1000);
+      const tsClose   = Math.floor(nextWindowClose  / 1000);
+      const nextLine  = nextWindowClose > now
+        ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)\n    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
+        : `🔄 Next window also passed — update manually`;
+      text = [
+        `⚠️ Timer possibly wrong`,
+        `🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
+        nextLine,
+        `👤 Last updated by: ${e.lastKiller}`,
+      ].join("\n");
+      isBroken = true;
+    }
+
+    return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
+  });
+
+  bosses.sort((a, b) => {
+    if (a.isBroken && !b.isBroken) return 1;
+    if (!a.isBroken && b.isBroken) return -1;
+    return a.timeLeft - b.timeLeft;
+  });
+
+  for (const b of bosses) embed.addFields({ name: `• ${b.name}`, value: b.text });
+  return embed;
 }
 
 // =====================
-// ATOMIC FULL REPIN
+// BUTTONS
 // =====================
-async function fullRepin(channel) {
-  if (repinInProgress) return;
-  repinInProgress = true;
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
-  // FIX: safety valve — if repin hangs for any reason, unlock after 30s so
-  // the next tick can try again rather than freezing the bot forever
-  if (repinTimeoutHandle) clearTimeout(repinTimeoutHandle);
-  repinTimeoutHandle = setTimeout(() => {
-    if (repinInProgress) {
-      console.warn("[Repin] Safety timeout fired — releasing repinInProgress lock");
-      repinInProgress = false;
-    }
-  }, 30 * 1000);
-
-  try {
-    const now = Date.now();
-
-    if (dashboardMessage) {
-      await dashboardMessage.delete().catch(() => {});
-      dashboardMessage = null;
-    }
-
-    for (const id of Object.keys(missedWindowMessages)) {
-      const w = missedWindowMessages[id];
-      clearTimeout(w.deleteTimer);
-      if (w.msg) w.msg.delete().catch(() => {});
-      w.msg = null; w.deleteTimer = null;
-    }
-
-    for (const id of Object.keys(spawnWindowMessages)) {
-      const w = spawnWindowMessages[id];
-      clearTimeout(w.deleteTimer);
-      if (w.msg) w.msg.delete().catch(() => {});
-      w.msg = null; w.deleteTimer = null;
-    }
-
-    for (const id of Object.keys(missedWindowMessages)) {
-      if (missedWindowMessages[id].nextWindowEnd + WINDOW_GRACE_MS <= now)
-        delete missedWindowMessages[id];
-    }
-    for (const id of Object.keys(spawnWindowMessages)) {
-      if (spawnWindowMessages[id].windowEnd + WINDOW_GRACE_MS <= now)
-        delete spawnWindowMessages[id];
-    }
-
-    dashboardMessage = await channel.send({
-      embeds:     [buildEmbed()],
-      components: buildButtons(),
-      flags:      MessageFlags.SuppressNotifications
-    });
-
-    const missedEntries = Object.entries(missedWindowMessages)
-      .filter(([, w]) => w.nextWindowStart <= now)
-      .sort(([, a], [, b]) => a.nextWindowEnd - b.nextWindowEnd);
-
-    for (const [id, w] of missedEntries) {
-      try {
-        const msg = await channel.send({
-          embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
-          components: buildMissedWindowComponents(id),
-          flags:      MessageFlags.SuppressNotifications
-        });
-        w.msg = msg;
-        const ttl = (w.nextWindowEnd - now) + WINDOW_GRACE_MS;
-        w.deleteTimer = setTimeout(() => {
-          msg.delete().catch(() => {});
-          delete missedWindowMessages[id];
-          lastStackFingerprint = "";
-        }, Math.max(ttl, 0));
-      } catch (err) {
-        console.error(`[Repin] Failed to post missed window for ${id}:`, err.message ?? err);
-        delete missedWindowMessages[id];
-      }
-    }
-
-    const spawnEntries = Object.entries(spawnWindowMessages)
-      .sort(([, a], [, b]) => a.windowEnd - b.windowEnd);
-
-    for (const [id, w] of spawnEntries) {
-      try {
-        const msg = await channel.send({
-          embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
-          components: buildSpawnWindowComponents(id),
-          flags:      MessageFlags.SuppressNotifications
-        });
-        w.msg = msg;
-        const ttl = (w.windowEnd - now) + WINDOW_GRACE_MS;
-        w.deleteTimer = setTimeout(() => {
-          msg.delete().catch(() => {});
-          delete spawnWindowMessages[id];
-          lastStackFingerprint = "";
-        }, Math.max(ttl, 0));
-      } catch (err) {
-        console.error(`[Repin] Failed to post spawn window for ${id}:`, err.message ?? err);
-        delete spawnWindowMessages[id];
-      }
-    }
-
-    lastStackFingerprint = computeStackFingerprint();
-    console.log(`[Repin] Stack: dashboard -> missed:[${Object.keys(missedWindowMessages).filter(id => missedWindowMessages[id].nextWindowStart <= now).join(",")}] -> spawn:[${Object.keys(spawnWindowMessages).join(",")}]`);
-
-  } catch (err) {
-    console.error("[Repin] Error:", err.message ?? err);
-  } finally {
-    repinInProgress = false;
-    if (repinTimeoutHandle) { clearTimeout(repinTimeoutHandle); repinTimeoutHandle = null; }
+function buildButtons() {
+  const rows = [];
+  for (const group of chunk(BOSSES, 5)) {
+    const row = new ActionRowBuilder();
+    for (const b of group)
+      row.addComponents(new ButtonBuilder().setCustomId("kill_" + b.id).setLabel(b.name.slice(0, 20)).setStyle(ButtonStyle.Primary));
+    rows.push(row);
   }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("insert_time").setLabel("📝 Insert").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("reset_all").setLabel("🧹 Reset").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("undo").setLabel("↩️ Undo").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("show_logs").setLabel("📜 Logs").setStyle(ButtonStyle.Secondary)
+  ));
+  return rows;
+}
+
+// =====================
+// REPIN DASHBOARD
+// Non-destructive: post new messages first, then delete old ones.
+// No lock needed — simple enough to be safe.
+// =====================
+async function repinDashboard(channel) {
+  const now = Date.now();
+
+  // 1. Post new dashboard first (never leaves a gap)
+  const newDashboard = await channel.send({
+    embeds:     [buildEmbed()],
+    components: buildButtons(),
+    flags:      MessageFlags.SuppressNotifications
+  }).catch(err => { console.error("[Repin] Failed to post dashboard:", err.message ?? err); return null; });
+
+  if (!newDashboard) return;
+
+  // 2. Delete old dashboard after new one is live
+  if (dashboardMessage) dashboardMessage.delete().catch(() => {});
+  dashboardMessage = newDashboard;
+
+  // 3. Repost spawn window messages below the new dashboard
+  for (const id of Object.keys(spawnWindowMessages)) {
+    const w = spawnWindowMessages[id];
+    if (w.msg) w.msg.delete().catch(() => {});
+
+    // Only repost if window is still active
+    if (w.windowEnd + WINDOW_GRACE_MS > now) {
+      const newMsg = await channel.send({
+        embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
+        components: buildSpawnWindowComponents(id),
+        flags:      MessageFlags.SuppressNotifications
+      }).catch(() => null);
+      w.msg = newMsg;
+    } else {
+      delete spawnWindowMessages[id];
+    }
+  }
+
+  // 4. Repost missed window messages below spawn windows
+  for (const id of Object.keys(missedWindowMessages)) {
+    const w = missedWindowMessages[id];
+
+    // Only show if window has already started
+    if (w.nextWindowStart > now) {
+      if (w.msg) { w.msg.delete().catch(() => {}); w.msg = null; }
+      continue;
+    }
+
+    if (w.nextWindowEnd + WINDOW_GRACE_MS <= now) {
+      if (w.msg) w.msg.delete().catch(() => {});
+      delete missedWindowMessages[id];
+      continue;
+    }
+
+    if (w.msg) w.msg.delete().catch(() => {});
+
+    const newMsg = await channel.send({
+      embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+      components: buildMissedWindowComponents(id),
+      flags:      MessageFlags.SuppressNotifications
+    }).catch(() => null);
+    w.msg = newMsg;
+  }
+
+  interactionCount = 0;
+  lastRepinTime    = now;
+  console.log("[Repin] Dashboard stack refreshed.");
 }
 
 // =====================
@@ -698,8 +717,22 @@ async function fullRepin(channel) {
 async function createSpawnWindow(boss, id, channel, windowEnd) {
   if (spawnWindowMessages[id]) return;
   const windowStart = windowEnd - 60 * 60 * 1000;
-  spawnWindowMessages[id] = { msg: null, windowStart, windowEnd, boss, deleteTimer: null };
-  lastStackFingerprint = "";
+
+  const msg = await channel.send({
+    embeds:     [buildSpawnWindowEmbed(boss, windowStart, windowEnd)],
+    components: buildSpawnWindowComponents(id),
+    flags:      MessageFlags.SuppressNotifications
+  }).catch(err => { console.error(`[SpawnWindow] Failed to post for ${id}:`, err.message ?? err); return null; });
+
+  if (!msg) return;
+
+  const deleteAfter = (windowEnd - Date.now()) + WINDOW_GRACE_MS;
+  const deleteTimer = setTimeout(() => {
+    msg.delete().catch(() => {});
+    delete spawnWindowMessages[id];
+  }, Math.max(deleteAfter, 0));
+
+  spawnWindowMessages[id] = { msg, windowStart, windowEnd, boss, deleteTimer };
 }
 
 // =====================
@@ -717,46 +750,121 @@ async function handleMissedWindow(boss, id, channel) {
   save();
 
   spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
-
   clearBossCards(id);
 
   const nextWindowStart = e.respawnTime;
   const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
 
   missedWindowMessages[id] = {
-    msg:            null,
-    deleteTimer:    null,
+    msg:          null,
+    deleteTimer:  null,
     nextWindowStart,
     nextWindowEnd,
-    pingedStart:    false,
-    pinged1h:       false,
-    pinged20min:    false,
+    pingedStart:  false,
+    pinged1h:     false,
+    pinged20min:  false,
     boss,
   };
 }
 
-async function tickMissedWindowMessages(channel) {
-  const now = Date.now();
+// =====================
+// MAIN LOOP — single loop, single responsibility
+// Edits messages in place every tick.
+// Repins on two simple triggers: time threshold or interaction count.
+// No fingerprint logic, no repin lock.
+// =====================
+function startLoop() {
+  setInterval(async () => {
+    try {
+      const channel = dashboardMessage
+        ? dashboardMessage.channel
+        : await client.channels.fetch(CHANNEL_ID).catch(() => null);
 
+      if (!channel) return;
+
+      const now = Date.now();
+
+      // ── Repin triggers (simple, like old bot) ──
+      const shouldRepin =
+        !dashboardMessage ||
+        (Date.now() - lastRepinTime >= REPIN_AFTER_MS) ||
+        (interactionCount >= REPIN_AFTER_INTERACTIONS);
+
+      if (shouldRepin) {
+        await repinDashboard(channel);
+        checkWarnings(channel);
+        await checkFixedEvents(channel);
+        return; // skip edits this tick; next tick will edit the fresh messages
+      }
+
+      // ── In-place edits (cheap, no chat spam) ──
+      await Promise.all([
+        // Dashboard
+        dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
+          .catch(err => {
+            if (err.code === 10008) {
+              // Message was deleted externally — trigger repin on next tick
+              dashboardMessage = null;
+            } else if (err.status !== 503 && err.status !== 502) {
+              console.error("[Loop] Dashboard edit failed:", err.message ?? err);
+            }
+          }),
+
+        // Spawn window messages
+        ...Object.entries(spawnWindowMessages)
+          .filter(([, w]) => w.msg)
+          .map(([id, w]) =>
+            w.msg.edit({
+              embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
+              components: buildSpawnWindowComponents(id)
+            }).catch(err => {
+              if (err.code === 10008) delete spawnWindowMessages[id];
+            })
+          ),
+
+        // Missed window messages
+        ...Object.entries(missedWindowMessages)
+          .filter(([, w]) => w.msg)
+          .map(([id, w]) =>
+            w.msg.edit({
+              embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+              components: buildMissedWindowComponents(id)
+            }).catch(err => {
+              if (err.code === 10008) delete missedWindowMessages[id];
+            })
+          )
+      ]);
+
+      // ── Missed window pings (run every tick, guarded by flags) ──
+      tickMissedWindowPings(channel, now);
+
+      // ── Boss warnings & fixed events ──
+      checkWarnings(channel);
+      await checkFixedEvents(channel);
+
+    } catch (err) {
+      console.error("[Loop] Tick error (recovered):", err.message ?? err);
+    }
+  }, TICK_RATE);
+}
+
+// =====================
+// MISSED WINDOW PINGS
+// Separated from the main loop purely to keep it readable.
+// Only sends @everyone messages — no message creation here.
+// =====================
+function tickMissedWindowPings(channel, now) {
   for (const id of Object.keys(missedWindowMessages)) {
     const w = missedWindowMessages[id];
-
-    if (w.nextWindowStart <= now && !w.msg) {
-      lastStackFingerprint = "";
-    }
-
-    if (!w.msg) continue;
-
-    w.msg.edit({
-      embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
-      components: buildMissedWindowComponents(id)
-    }).catch(() => {});
-
     const untilStart = w.nextWindowStart - now;
     const untilEnd   = w.nextWindowEnd   - now;
 
-    // FIX: pingedStart now only sends ONE message when window opens.
-    // Removed the redundant channel.send() that was duplicating the @everyone ping.
+    // Window just opened — post the missed card if it doesn't exist yet
+    if (untilStart <= 0 && !w.msg && untilEnd + WINDOW_GRACE_MS > 0) {
+      // Will be created on next repin; trigger one
+      lastRepinTime = 0;
+    }
+
     if (!w.pingedStart && untilStart <= 0 && untilEnd > 0) {
       w.pingedStart = true;
       const tsClose = Math.floor(w.nextWindowEnd / 1000);
@@ -767,8 +875,6 @@ async function tickMissedWindowMessages(channel) {
       postEveryoneWarning(channel, `${id}_missed_start`, content);
     }
 
-    // FIX: these two pings are now routed through postEveryoneWarning so they
-    // replace each other rather than stacking, and use keyed deduplication.
     if (!w.pinged1h && untilEnd > 0 && untilEnd <= 60 * 60 * 1000) {
       w.pinged1h = true;
       const content =
@@ -782,6 +888,63 @@ async function tickMissedWindowMessages(channel) {
       const content =
         `@everyone ⚠️ **${w.boss.name}** missed-window: **20 minutes remaining** in the spawn window!`;
       postEveryoneWarning(channel, `${id}_missed_20min`, content);
+    }
+  }
+}
+
+// =====================
+// WARNING SYSTEM
+// =====================
+function checkWarnings(channel) {
+  const now = Date.now();
+
+  if (now - BOT_START_TIME < STARTUP_GRACE_MS) return;
+
+  for (const b of BOSSES) {
+    const e = data.kills[b.id];
+    if (!e) continue;
+
+    const cooldown               = e.respawnTime - now;
+    const windowEnd              = e.respawnTime + 60 * 60 * 1000;
+    const windowLeft             = windowEnd - now;
+    const timeSinceWindowExpired = now - windowEnd;
+
+    if (!spawnWarnings[b.id])
+      spawnWarnings[b.id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
+
+    const w = spawnWarnings[b.id];
+
+    // 5 min warning — lifespan = cooldown remaining so it self-deletes as window opens
+    if (cooldown > 0 && cooldown <= 5 * 60 * 1000 && !w.warned5) {
+      w.warned5 = true;
+      if (!missedWindowMessages[b.id]) {
+        postEveryoneWarning(channel, `${b.id}_5min`, `@everyone ⏳ **${b.name}** spawns in 5 minutes`, Math.max(cooldown, 0));
+      }
+    }
+
+    // Window opened — create spawn window card
+    if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
+      w.windowCreated = true;
+      clearEveryoneWarning(`${b.id}_5min`);
+      if (!missedWindowMessages[b.id]) {
+        createSpawnWindow(b, b.id, channel, windowEnd);
+      }
+    }
+
+    // 20 min remaining in window
+    if (cooldown <= 0 && windowLeft > 0 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
+      w.warned20 = true;
+      postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** spawn window closes in 20 minutes!`);
+    }
+
+    // Missed window — auto-advance timer (tracked bosses only)
+    if (
+      TRACKED_BOSS_TYPES.has(b.type) &&
+      timeSinceWindowExpired >= 10 * 60 * 1000 &&
+      !w.missedHandled
+    ) {
+      w.missedHandled = true;
+      handleMissedWindow(b, b.id, channel);
     }
   }
 }
@@ -827,214 +990,6 @@ async function checkFixedEvents(channel) {
 }
 
 // =====================
-// DASHBOARD EMBED
-// =====================
-function buildEmbed() {
-  const now   = Date.now();
-  const embed = new EmbedBuilder()
-    .setTitle("🔥 LIVE MU TRACKER")
-    .setColor(0xffaa00)
-    .setFooter({ text: "Auto-updates every 5s" });
-
-  const bosses = BOSSES.map(b => {
-    const e = data.kills[b.id];
-    if (!e) return { name: b.name, timeLeft: 0, text: "🟢 READY\n👤 None", isBroken: false };
-
-    const cooldown   = e.respawnTime - now;
-    const windowEnd  = e.respawnTime + 60 * 60 * 1000;
-    const windowLeft = windowEnd - now;
-    let text, isBroken = false;
-
-    if (cooldown > 0) {
-      const tsRespawn = Math.floor(e.respawnTime / 1000);
-      text = `🔴 ${format(cooldown)}\n🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
-    } else if (windowLeft > 0) {
-      const tsRespawn = Math.floor(e.respawnTime / 1000);
-      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
-    } else {
-      const nextWindowOpen  = e.respawnTime + 60 * 60 * 1000;
-      const nextWindowClose = e.respawnTime + 2 * 60 * 60 * 1000;
-      const tsOpen  = Math.floor(nextWindowOpen  / 1000);
-      const tsClose = Math.floor(nextWindowClose / 1000);
-      const nextLine = nextWindowClose > now
-        ? `🔄 Next possible: <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
-        : `🔄 Next window also passed — update manually`;
-      text = `⚠️ Timer possibly wrong\n🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server)\n${nextLine}\n👤 ${e.lastKiller}`;
-      isBroken = true;
-    }
-
-    return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
-  });
-
-  bosses.sort((a, b) => {
-    if (a.isBroken && !b.isBroken) return 1;
-    if (!a.isBroken && b.isBroken) return -1;
-    return a.timeLeft - b.timeLeft;
-  });
-
-  for (const b of bosses) embed.addFields({ name: `• ${b.name}`, value: b.text });
-  return embed;
-}
-
-// =====================
-// BUTTONS
-// =====================
-function chunk(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
-
-function buildButtons() {
-  const rows = [];
-  for (const group of chunk(BOSSES, 5)) {
-    const row = new ActionRowBuilder();
-    for (const b of group)
-      row.addComponents(new ButtonBuilder().setCustomId("kill_" + b.id).setLabel(b.name.slice(0, 20)).setStyle(ButtonStyle.Primary));
-    rows.push(row);
-  }
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("insert_time").setLabel("📝 Insert").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("reset_all").setLabel("🧹 Reset").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("undo").setLabel("↩️ Undo").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("show_logs").setLabel("📜 Logs").setStyle(ButtonStyle.Secondary)
-  ));
-  return rows;
-}
-
-// =====================
-// MAIN LOOP — wrapped in try/catch so one bad tick never kills the interval
-// =====================
-function startLoop() {
-  setInterval(async () => {
-    try {
-      // FIX: if dashboardMessage is null, still allow fullRepin to recover it
-      // by fetching the channel directly instead of bailing out immediately.
-      // We only skip if we have no way to know which channel to use.
-      const channel = dashboardMessage
-        ? dashboardMessage.channel
-        : await client.channels.fetch(CHANNEL_ID).catch(() => null);
-
-      if (!channel) return;
-
-      await tickMissedWindowMessages(channel);
-
-      const currentFingerprint = computeStackFingerprint();
-      if (currentFingerprint !== lastStackFingerprint || !dashboardMessage) {
-        await fullRepin(channel);
-      }
-
-      if (!dashboardMessage) return;
-
-      await Promise.all([
-        dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
-          .catch(err => {
-            if (err.code === 10008) { dashboardMessage = null; lastStackFingerprint = ""; }
-            else if (err.status !== 503 && err.status !== 502) {
-              console.error("[Loop] Dashboard edit failed:", err.message ?? err);
-            }
-          }),
-
-        ...Object.entries(missedWindowMessages)
-          .filter(([, w]) => w.msg)
-          .map(([id, w]) =>
-            w.msg.edit({
-              embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
-              components: buildMissedWindowComponents(id)
-            }).catch(err => {
-              if (err.code === 10008) { delete missedWindowMessages[id]; lastStackFingerprint = ""; }
-            })
-          ),
-
-        ...Object.entries(spawnWindowMessages)
-          .filter(([, w]) => w.msg)
-          .map(([id, w]) =>
-            w.msg.edit({
-              embeds:     [buildSpawnWindowEmbed(w.boss, w.windowStart, w.windowEnd)],
-              components: buildSpawnWindowComponents(id)
-            }).catch(err => {
-              if (err.code === 10008) { delete spawnWindowMessages[id]; lastStackFingerprint = ""; }
-            })
-          )
-      ]);
-
-      checkWarnings(channel);
-      await checkFixedEvents(channel);
-
-    } catch (err) {
-      console.error("[Loop] Tick error (recovered):", err.message ?? err);
-    }
-  }, TICK_RATE);
-}
-
-// =====================
-// WARNING SYSTEM
-// =====================
-function checkWarnings(channel) {
-  const now = Date.now();
-
-  // Don't fire any warnings during the startup grace period to avoid
-  // ghost-pinging for timers already past their threshold before restart
-  if (now - BOT_START_TIME < STARTUP_GRACE_MS) return;
-
-  for (const b of BOSSES) {
-    const e = data.kills[b.id];
-    if (!e) continue;
-
-    const cooldown               = e.respawnTime - now;
-    const windowEnd              = e.respawnTime + 60 * 60 * 1000;
-    const windowLeft             = windowEnd - now;
-    const timeSinceWindowExpired = now - windowEnd;
-
-    if (!spawnWarnings[b.id])
-      spawnWarnings[b.id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
-
-    const w = spawnWarnings[b.id];
-
-    // 5 min before respawn — only fires while boss is still on cooldown
-    // and there is no active missed-window card for this boss
-    if (cooldown > 0 && cooldown <= 5 * 60 * 1000 && !w.warned5) {
-      w.warned5 = true;
-      if (!missedWindowMessages[b.id]) {
-        // Lifespan = cooldown remaining (≤5 min) so the message deletes itself
-        // right as the window opens and the repin cycle never has time to fire.
-        postEveryoneWarning(channel, `${b.id}_5min`, `@everyone ⏳ **${b.name}** spawns in 5 minutes`, Math.max(cooldown, 0));
-      }
-    }
-
-    // Window just opened — post green spawn-window card and kill the 5-min ping.
-    // warned20 is intentionally NOT fired here; the green card itself signals
-    // the window is open. The only additional ping inside an active window is
-    // the 20-min-remaining one below, which fires once near the end.
-    if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
-      w.windowCreated = true;
-      // _5min warning already expired naturally (lifespan = cooldown at fire time).
-      // Clear it defensively in case of edge-case timing.
-      clearEveryoneWarning(`${b.id}_5min`);
-      if (!missedWindowMessages[b.id]) {
-        createSpawnWindow(b, b.id, channel, windowEnd);
-      }
-    }
-
-    // 20 min remaining in window — fires only once, only near the END of the
-    // window, never at open time (guarded by windowLeft <= 20min).
-    if (cooldown <= 0 && windowLeft > 0 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
-      w.warned20 = true;
-      postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** spawn window closes in 20 minutes!`);
-    }
-
-    if (
-      TRACKED_BOSS_TYPES.has(b.type) &&
-      timeSinceWindowExpired >= 10 * 60 * 1000 &&
-      !w.missedHandled
-    ) {
-      w.missedHandled = true;
-      handleMissedWindow(b, b.id, channel);
-    }
-  }
-}
-
-// =====================
 // CLEANUP HELPER
 // =====================
 function clearBossCards(id) {
@@ -1050,7 +1005,6 @@ function clearBossCards(id) {
   }
   clearEveryoneWarning(`${id}_5min`);
   clearEveryoneWarning(`${id}_20min`);
-  // FIX: also clear the missed-window warning keys when a boss card is cleared
   clearEveryoneWarning(`${id}_missed_start`);
   clearEveryoneWarning(`${id}_missed_1h`);
   clearEveryoneWarning(`${id}_missed_20min`);
@@ -1072,7 +1026,7 @@ client.once(Events.ClientReady, async () => {
 
   if (DATA_BACKUP_CHANNEL_ID) {
     try { await initBackupMessages(await client.channels.fetch(DATA_BACKUP_CHANNEL_ID)); }
-    catch (err) { console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID, falling back to main channel:", err.message ?? err); await initBackupMessages(channel); }
+    catch (err) { console.error("[Backup] Could not fetch DATA_BACKUP_CHANNEL_ID:", err.message ?? err); await initBackupMessages(channel); }
   } else {
     await initBackupMessages(channel);
   }
@@ -1082,7 +1036,9 @@ client.once(Events.ClientReady, async () => {
     components: buildButtons(),
     flags:      MessageFlags.SuppressNotifications
   });
-  lastStackFingerprint = computeStackFingerprint();
+
+  lastRepinTime    = Date.now();
+  interactionCount = 0;
 
   startLoop();
   startBackupLoop();
@@ -1096,6 +1052,10 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
 
+  // Count interactions — repin fires when threshold is hit in the main loop
+  interactionCount++;
+
+  // ── KILL BUTTON ──
   if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
     snapshot();
     const id          = interaction.customId.replace("kill_", "");
@@ -1114,6 +1074,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── WINDOW KILL ──
   if (interaction.isButton() && interaction.customId.startsWith("window_kill_")) {
     snapshot();
     const id          = interaction.customId.replace("window_kill_", "");
@@ -1133,6 +1094,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── WINDOW SET TIME — show modal ──
   if (interaction.isButton() && interaction.customId.startsWith("window_settime_")) {
     const id   = interaction.customId.replace("window_settime_", "");
     const boss = BOSSES.find(b => b.id === id);
@@ -1144,6 +1106,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.showModal(modal);
   }
 
+  // ── WINDOW SET TIME — modal submit ──
   if (interaction.isModalSubmit() && interaction.customId.startsWith("window_killtime_")) {
     snapshot();
     const id          = interaction.customId.replace("window_killtime_", "");
@@ -1164,6 +1127,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── MISSED KILL ──
   if (interaction.isButton() && interaction.customId.startsWith("missed_kill_")) {
     snapshot();
     const id          = interaction.customId.replace("missed_kill_", "");
@@ -1183,6 +1147,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── MISSED SET TIME — show modal ──
   if (interaction.isButton() && interaction.customId.startsWith("missed_settime_")) {
     const id   = interaction.customId.replace("missed_settime_", "");
     const boss = BOSSES.find(b => b.id === id);
@@ -1196,6 +1161,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.showModal(modal);
   }
 
+  // ── MISSED SET TIME — modal submit ──
   if (interaction.isModalSubmit() && interaction.customId.startsWith("missed_killtime_")) {
     snapshot();
     const id          = interaction.customId.replace("missed_killtime_", "");
@@ -1216,6 +1182,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── INSERT TIME — boss picker ──
   if (interaction.isButton() && interaction.customId === "insert_time") {
     log(interaction.user, `Opened insert: boss selection menu`);
     const menu = new StringSelectMenuBuilder()
@@ -1228,6 +1195,7 @@ client.on(Events.InteractionCreate, async interaction => {
     });
   }
 
+  // ── INSERT TIME — modal trigger ──
   if (interaction.isStringSelectMenu() && interaction.customId === "select_boss_insert") {
     const id   = interaction.values[0];
     const boss = BOSSES.find(b => b.id === id);
@@ -1239,6 +1207,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.showModal(modal);
   }
 
+  // ── INSERT TIME — modal submit ──
   if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_server_")) {
     snapshot();
     const id          = interaction.customId.replace("killtime_server_", "");
@@ -1258,6 +1227,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── RESET — picker ──
   if (interaction.isButton() && interaction.customId === "reset_all") {
     log(interaction.user, `Opened reset menu`);
     const menu = new StringSelectMenuBuilder()
@@ -1273,6 +1243,7 @@ client.on(Events.InteractionCreate, async interaction => {
     });
   }
 
+  // ── RESET — apply ──
   if (interaction.isStringSelectMenu() && interaction.customId === "reset_select") {
     snapshot();
     const value = interaction.values[0];
@@ -1306,6 +1277,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── UNDO ──
   if (interaction.isButton() && interaction.customId === "undo") {
     if (undo()) {
       log(interaction.user, `UNDO`);
@@ -1316,6 +1288,7 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
+  // ── LOGS ──
   if (interaction.isButton() && interaction.customId === "show_logs") {
     return interaction.reply({
       embeds: [buildLogEmbed()],
