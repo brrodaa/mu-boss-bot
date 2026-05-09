@@ -53,10 +53,6 @@ const client = new Client({
 const TICK_RATE  = 5000;
 const MAX_UNDO   = 10;
 
-// Repin triggers (simple, like old bot — no fingerprint logic)
-const REPIN_AFTER_INTERACTIONS = 5;
-const REPIN_AFTER_MS           = 2 * 60 * 1000;
-
 const EVERYONE_WARNING_LIFESPAN_MS    = 10 * 60 * 1000;
 const EVERYONE_REPIN_BEFORE_EXPIRE_MS =  1 * 60 * 1000;
 
@@ -75,9 +71,6 @@ let everyoneWarnings     = {};
 
 let adminLogs = [];
 let undoStack = [];
-
-let interactionCount = 0;
-let lastRepinTime    = Date.now();
 
 const MAX_DISCORD_BACKUPS = 7;
 let backupMessages  = [];
@@ -425,17 +418,11 @@ function undo() {
 // =====================
 // ANNOUNCE HELPERS
 // =====================
-async function announceKill(channel, user, action, extra = "") {
-  const content = `⚔️ **${user.username}** ${action} — ${toServerDateTimeStr(Date.now())} (server time)${extra ? `\n${extra}` : ""}`;
-  await channel.send({ content, flags: MessageFlags.SuppressNotifications });
-  forwardToLogChannel(content);
-}
 
-async function announceAdmin(channel, user, action) {
-  const content = `📢 **${user.username}** ${action} — ${toServerDateTimeStr(Date.now())} (server time)`;
-  const msg     = await channel.send({ content, flags: MessageFlags.SuppressNotifications });
-  forwardToLogChannel(content);
-  setTimeout(() => { msg.delete().catch(() => {}); }, 10 * 60 * 1000);
+// Strip @everyone and @here before archiving so the log channel
+// doesn't ping anyone when the message is forwarded.
+function stripPings(content) {
+  return content.replace(/@everyone/g, "everyone").replace(/@here/g, "here");
 }
 
 async function forwardToLogChannel(content) {
@@ -445,6 +432,25 @@ async function forwardToLogChannel(content) {
     const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
     await logCh.send({ content, flags: MessageFlags.SuppressNotifications });
   } catch (err) { console.error("[Log Channel]", err.message ?? err); }
+}
+
+async function announceKill(channel, user, action, extra = "") {
+  const content = `⚔️ **${user.username}** ${action} — ${toServerDateTimeStr(Date.now())} (server time)${extra ? `\n${extra}` : ""}`;
+  const msg = await channel.send({ content, flags: MessageFlags.SuppressNotifications });
+  // After 5 min: delete from tracker channel, then archive (stripped) to log channel
+  setTimeout(() => {
+    msg.delete().catch(() => {});
+    forwardToLogChannel(stripPings(content));
+  }, 5 * 60 * 1000);
+}
+
+async function announceAdmin(channel, user, action) {
+  const content = `📢 **${user.username}** ${action} — ${toServerDateTimeStr(Date.now())} (server time)`;
+  const msg     = await channel.send({ content, flags: MessageFlags.SuppressNotifications });
+  setTimeout(() => {
+    msg.delete().catch(() => {});
+    forwardToLogChannel(stripPings(content));
+  }, 5 * 60 * 1000);
 }
 
 // =====================
@@ -484,6 +490,7 @@ function scheduleEveryoneWarningCycle(channel, key, content, msg, lifespanMs = E
   const deleteTimer = setTimeout(() => {
     if (!everyoneWarnings[key]) return;
     everyoneWarnings[key].msg.delete().catch(() => {});
+    forwardToLogChannel(stripPings(everyoneWarnings[key].content));
     delete everyoneWarnings[key];
   }, lifespanMs);
 
@@ -706,8 +713,6 @@ async function repinDashboard(channel) {
     w.msg = newMsg;
   }
 
-  interactionCount = 0;
-  lastRepinTime    = now;
   console.log("[Repin] Dashboard stack refreshed.");
 }
 
@@ -770,8 +775,8 @@ async function handleMissedWindow(boss, id, channel) {
 // =====================
 // MAIN LOOP — single loop, single responsibility
 // Edits messages in place every tick.
-// Repins on two simple triggers: time threshold or interaction count.
-// No fingerprint logic, no repin lock.
+// Only repins if the dashboard was deleted externally (error 10008).
+// No fingerprint logic, no repin lock, no time/interaction triggers.
 // =====================
 function startLoop() {
   setInterval(async () => {
@@ -784,17 +789,12 @@ function startLoop() {
 
       const now = Date.now();
 
-      // ── Repin triggers (simple, like old bot) ──
-      const shouldRepin =
-        !dashboardMessage ||
-        (Date.now() - lastRepinTime >= REPIN_AFTER_MS) ||
-        (interactionCount >= REPIN_AFTER_INTERACTIONS);
-
-      if (shouldRepin) {
+      // ── Repin only if dashboard was deleted externally ──
+      if (!dashboardMessage) {
         await repinDashboard(channel);
         checkWarnings(channel);
         await checkFixedEvents(channel);
-        return; // skip edits this tick; next tick will edit the fresh messages
+        return;
       }
 
       // ── In-place edits (cheap, no chat spam) ──
@@ -861,8 +861,12 @@ function tickMissedWindowPings(channel, now) {
 
     // Window just opened — post the missed card if it doesn't exist yet
     if (untilStart <= 0 && !w.msg && untilEnd + WINDOW_GRACE_MS > 0) {
-      // Will be created on next repin; trigger one
-      lastRepinTime = 0;
+      // Post it directly so it appears without needing a full repin
+      channel.send({
+        embeds:     [buildMissedWindowEmbed(w.boss, w.nextWindowStart, w.nextWindowEnd)],
+        components: buildMissedWindowComponents(id),
+        flags:      MessageFlags.SuppressNotifications
+      }).then(msg => { w.msg = msg; }).catch(() => {});
     }
 
     if (!w.pingedStart && untilStart <= 0 && untilEnd > 0) {
@@ -1037,9 +1041,6 @@ client.once(Events.ClientReady, async () => {
     flags:      MessageFlags.SuppressNotifications
   });
 
-  lastRepinTime    = Date.now();
-  interactionCount = 0;
-
   startLoop();
   startBackupLoop();
 
@@ -1051,9 +1052,6 @@ client.once(Events.ClientReady, async () => {
 // =====================
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
-
-  // Count interactions — repin fires when threshold is hit in the main loop
-  interactionCount++;
 
   // ── KILL BUTTON ──
   if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
