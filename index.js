@@ -503,15 +503,20 @@ function scheduleEveryoneWarningCycle(channel, key, content, msg) {
   const repinDelay = EVERYONE_WARNING_LIFESPAN_MS - EVERYONE_REPIN_BEFORE_EXPIRE_MS;
 
   const repinTimer = setTimeout(async () => {
-    if (!everyoneWarnings[key]) return;
-    everyoneWarnings[key].msg.delete().catch(() => {});
+    try {
+      if (!everyoneWarnings[key]) return;
+      everyoneWarnings[key].msg.delete().catch(() => {});
 
-    let newMsg;
-    try { newMsg = await channel.send({ content }); }
-    catch { delete everyoneWarnings[key]; return; }
+      let newMsg;
+      try { newMsg = await channel.send({ content }); }
+      catch { delete everyoneWarnings[key]; return; }
 
-    everyoneWarnings[key].msg = newMsg;
-    scheduleEveryoneWarningCycle(channel, key, content, newMsg);
+      everyoneWarnings[key].msg = newMsg;
+      scheduleEveryoneWarningCycle(channel, key, content, newMsg);
+    } catch (err) {
+      console.error('[Warning] repinTimer error:', err.message ?? err);
+      delete everyoneWarnings[key];
+    }
   }, repinDelay);
 
   const deleteTimer = setTimeout(() => {
@@ -1013,9 +1018,10 @@ function checkWarnings(channel) {
       }
     }
 
-    if (cooldown <= 0 && windowLeft > 2 * 60 * 1000 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
+    // Fires when windowLeft drops INTO <=20min zone (window opened at 60min, so this is 40+min in)
+    if (cooldown <= 0 && windowLeft > 0 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
       w.warned20 = true;
-      postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** may spawn in 20 minutes`);
+      postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** spawn window closes in 20 minutes!`);
     }
 
     if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
