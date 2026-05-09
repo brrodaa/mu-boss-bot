@@ -3,7 +3,6 @@
 // =====================
 process.on("uncaughtException", (err) => {
   console.error("[UncaughtException]", err.message, err.stack);
-  // deliberately NOT calling process.exit() so Railway keeps the process alive
 });
 
 process.on("unhandledRejection", (err) => {
@@ -65,10 +64,10 @@ const WINDOW_GRACE_MS = 15 * 60 * 1000;
 let data = { kills: {} };
 let dashboardMessage = null;
 
-let spawnWarnings = {};
-let spawnWindowMessages = {};
+let spawnWarnings        = {};
+let spawnWindowMessages  = {};
 let missedWindowMessages = {};
-let everyoneWarnings = {};
+let everyoneWarnings     = {};
 
 let adminLogs = [];
 let undoStack = [];
@@ -79,9 +78,9 @@ let backupSlotIndex = 0;
 let logMessage      = null;
 
 let lastStackFingerprint = "";
-let repinInProgress = false;
+let repinInProgress      = false;
 
-const BOT_START_TIME = Date.now();
+const BOT_START_TIME   = Date.now();
 const STARTUP_GRACE_MS = 30 * 1000;
 
 // =====================
@@ -89,10 +88,10 @@ const STARTUP_GRACE_MS = 30 * 1000;
 // =====================
 function buildBosses() {
   const bosses = [];
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `lorencia_${i}`, name: `Kharzul #${i}`,          type: "kharzul" });
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `davias_${i}`,   name: `Vescrya #${i}`,           type: "vescrya" });
-  for (let i = 1; i <= 2; i++) bosses.push({ id: `crywolf_${i}`,  name: `Muggron #${i} Crywolf`,   type: "muggron" });
-  for (let i = 1; i <= 2; i++) bosses.push({ id: `barracks_${i}`, name: `Muggron #${i} Barracks`,  type: "muggron" });
+  for (let i = 1; i <= 3; i++) bosses.push({ id: `lorencia_${i}`, name: `Kharzul #${i}`,         type: "kharzul" });
+  for (let i = 1; i <= 3; i++) bosses.push({ id: `davias_${i}`,   name: `Vescrya #${i}`,          type: "vescrya" });
+  for (let i = 1; i <= 2; i++) bosses.push({ id: `crywolf_${i}`,  name: `Muggron #${i} Crywolf`,  type: "muggron" });
+  for (let i = 1; i <= 2; i++) bosses.push({ id: `barracks_${i}`, name: `Muggron #${i} Barracks`, type: "muggron" });
   return bosses;
 }
 const BOSSES = buildBosses();
@@ -103,62 +102,22 @@ const TRACKED_BOSS_TYPES = new Set(["kharzul", "vescrya"]);
 // FIXED EVENTS
 // =====================
 const FIXED_EVENTS = [
-  {
-    name: "🟡 Golden Invasion",
-    times: ["00:36","04:36","08:36","12:36","16:36","20:36"],
-    warnMinutes: 5,
-  },
-  {
-    name: "🧙 White Wizard",
-    times: ["09:45","12:45","15:45","18:45"],
-    warnMinutes: 5,
-  },
-  {
-    name: "💀 Death King",
-    times: ["21:45","00:45","03:45","06:45"],
-    warnMinutes: 5,
-  },
-  {
-    name: "⚡ Zaikan",
-    times: ["00:55","06:55","12:55","18:55"],
-    warnMinutes: 5,
-  },
-  {
-    name: "🐉 Red Dragon",
-    times: ["08:00","20:00"],
-    warnMinutes: 5,
-  },
-  {
-    name: "🎅 Cursed Santa",
-    times: ["02:35","08:35","14:35","20:35"],
-    warnMinutes: 5,
-  },
-  {
-    name: "🏰 Chaos Castle",
-    times: ["13:55","17:55","21:55","01:55","05:55","09:55"],
-    warnMinutes: 5,
-  },
+  { name: "🟡 Golden Invasion",   times: ["00:36","04:36","08:36","12:36","16:36","20:36"], warnMinutes: 5 },
+  { name: "🧙 White Wizard",      times: ["09:45","12:45","15:45","18:45"],                 warnMinutes: 5 },
+  { name: "💀 Death King",        times: ["21:45","00:45","03:45","06:45"],                 warnMinutes: 5 },
+  { name: "⚡ Zaikan",            times: ["00:55","06:55","12:55","18:55"],                 warnMinutes: 5 },
+  { name: "🐉 Red Dragon",        times: ["08:00","20:00"],                                 warnMinutes: 5 },
+  { name: "🎅 Cursed Santa",      times: ["02:35","08:35","14:35","20:35"],                 warnMinutes: 5 },
+  { name: "🏰 Chaos Castle",      times: ["13:55","17:55","21:55","01:55","05:55","09:55"], warnMinutes: 5 },
   {
     name: "⚔️ Battle Royale",
     times: ["02:00","08:00","14:00","20:00","23:00"],
     warnMinutes: 10,
     extraNote: "⚠️ Registration opens **5 minutes before** the event starts — be ready!",
   },
-  {
-    name: "🐇 Lunar Rabbit",
-    times: ["05:25","11:25","17:25","23:25"],
-    warnMinutes: 5,
-  },
-  {
-    name: "🔥 Fire Flame",
-    times: ["01:25","07:25","13:25","19:25"],
-    warnMinutes: 5,
-  },
-  {
-    name: "🎁 Pouch of Blessing",
-    times: ["03:25","09:25","15:25","21:25"],
-    warnMinutes: 5,
-  },
+  { name: "🐇 Lunar Rabbit",      times: ["05:25","11:25","17:25","23:25"], warnMinutes: 5 },
+  { name: "🔥 Fire Flame",        times: ["01:25","07:25","13:25","19:25"], warnMinutes: 5 },
+  { name: "🎁 Pouch of Blessing", times: ["03:25","09:25","15:25","21:25"], warnMinutes: 5 },
 ];
 
 const eventPingedKeys = new Set();
@@ -205,7 +164,7 @@ function nextOccurrenceMs(hhmm, afterMs) {
   const afterDt = new Date(afterMs);
 
   for (let dayOffset = 0; dayOffset <= 1; dayOffset++) {
-    const base    = new Date(afterDt);
+    const base      = new Date(afterDt);
     base.setDate(base.getDate() + dayOffset);
     const dateStr   = base.toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
     const candidate = new Date(`${dateStr}T${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`);
@@ -333,8 +292,8 @@ async function initBackupMessages(backupChannel) {
   backupSlotIndex = 0;
 
   try {
-    const existing  = await backupChannel.messages.fetch({ limit: 50 });
-    const botSlots  = [...existing.values()]
+    const existing = await backupChannel.messages.fetch({ limit: 50 });
+    const botSlots = [...existing.values()]
       .filter(m =>
         m.author.id === client.user.id &&
         m.embeds.length > 0 &&
@@ -357,8 +316,8 @@ async function initBackupMessages(backupChannel) {
     const isoStamp = new Date().toISOString().replace(/:/g, "-").slice(0, 16);
     const msg = await backupChannel.send({
       embeds: [buildBackupEmbed(i, null)],
-      files: [{ attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-slot${i}-${isoStamp}.json` }],
-      flags: MessageFlags.SuppressNotifications
+      files:  [{ attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-slot${i}-${isoStamp}.json` }],
+      flags:  MessageFlags.SuppressNotifications
     });
     backupMessages.push(msg);
   }
@@ -373,11 +332,10 @@ async function updateDiscordBackupSlot() {
   try {
     await backupMessages[slot].edit({
       embeds: [buildBackupEmbed(slotNumber, Date.now())],
-      files: [{ attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-slot${slotNumber}-${isoStamp}.json` }]
+      files:  [{ attachment: Buffer.from(JSON.stringify(data, null, 2), "utf8"), name: `backup-slot${slotNumber}-${isoStamp}.json` }]
     });
     console.log(`[Backup] Slot ${slotNumber} updated.`);
   } catch (err) {
-    // Don't let backup errors propagate — just log what matters
     if (err.status === 503 || err.status === 502) {
       console.warn(`[Backup] Slot ${slotNumber} — Discord temporarily unavailable (${err.status}), will retry next cycle`);
     } else {
@@ -514,7 +472,7 @@ function scheduleEveryoneWarningCycle(channel, key, content, msg) {
       everyoneWarnings[key].msg = newMsg;
       scheduleEveryoneWarningCycle(channel, key, content, newMsg);
     } catch (err) {
-      console.error('[Warning] repinTimer error:', err.message ?? err);
+      console.error("[Warning] repinTimer error:", err.message ?? err);
       delete everyoneWarnings[key];
     }
   }, repinDelay);
@@ -935,7 +893,6 @@ function startLoop() {
       if (!dashboardMessage) return;
       const channel = dashboardMessage.channel;
 
-      // STEP 1: Fingerprint check
       await tickMissedWindowMessages(channel);
 
       const currentFingerprint = computeStackFingerprint();
@@ -943,7 +900,6 @@ function startLoop() {
         await fullRepin(channel);
       }
 
-      // STEP 2: Fast path — all edits fired concurrently
       await Promise.all([
         dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
           .catch(err => {
@@ -976,12 +932,10 @@ function startLoop() {
           )
       ]);
 
-      // STEP 3: Warnings & event checks
       checkWarnings(channel);
       await checkFixedEvents(channel);
 
     } catch (err) {
-      // Log the error but let the interval keep running on the next tick
       console.error("[Loop] Tick error (recovered):", err.message ?? err);
     }
   }, TICK_RATE);
@@ -994,16 +948,16 @@ function checkWarnings(channel) {
   const now = Date.now();
 
   // Don't fire any warnings during the startup grace period to avoid
-  // ghost-pinging for timers that were already past their threshold before restart
+  // ghost-pinging for timers already past their threshold before restart
   if (now - BOT_START_TIME < STARTUP_GRACE_MS) return;
 
   for (const b of BOSSES) {
     const e = data.kills[b.id];
     if (!e) continue;
 
-    const cooldown   = e.respawnTime - now;
-    const windowEnd  = e.respawnTime + 60 * 60 * 1000;
-    const windowLeft = windowEnd - now;
+    const cooldown               = e.respawnTime - now;
+    const windowEnd              = e.respawnTime + 60 * 60 * 1000;
+    const windowLeft             = windowEnd - now;
     const timeSinceWindowExpired = now - windowEnd;
 
     if (!spawnWarnings[b.id])
@@ -1011,6 +965,7 @@ function checkWarnings(channel) {
 
     const w = spawnWarnings[b.id];
 
+    // 5 min before respawn
     if (cooldown > 0 && cooldown <= 5 * 60 * 1000 && !w.warned5) {
       w.warned5 = true;
       if (!missedWindowMessages[b.id]) {
@@ -1018,14 +973,17 @@ function checkWarnings(channel) {
       }
     }
 
-    // Fires when windowLeft drops INTO <=20min zone (window opened at 60min, so this is 40+min in)
+    // 20 min left in window — fires 40min after window opens, never at open time
     if (cooldown <= 0 && windowLeft > 0 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
       w.warned20 = true;
       postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** spawn window closes in 20 minutes!`);
     }
 
+    // Window just opened — post green card and immediately kill the 5min ping
+    // so its 9-minute repin can never fire inside the open window
     if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
       w.windowCreated = true;
+      clearEveryoneWarning(`${b.id}_5min`);
       if (!missedWindowMessages[b.id]) {
         createSpawnWindow(b, b.id, channel, windowEnd);
       }
@@ -1082,9 +1040,9 @@ client.once(Events.ClientReady, async () => {
   }
 
   dashboardMessage = await channel.send({
-    embeds: [buildEmbed()],
+    embeds:     [buildEmbed()],
     components: buildButtons(),
-    flags: MessageFlags.SuppressNotifications
+    flags:      MessageFlags.SuppressNotifications
   });
   lastStackFingerprint = computeStackFingerprint();
 
