@@ -988,7 +988,9 @@ async function checkFixedEvents(channel) {
         `🕒 ${eventTimeStr} (server time) — <t:${tsEvent}:t> (your local time)`;
       if (ev.extraNote) msg += `\n${ev.extraNote}`;
 
-      channel.send(msg);
+      channel.send(msg).then(sent => {
+        setTimeout(() => sent.delete().catch(() => {}), 5 * 60 * 1000);
+      }).catch(() => {});
       forwardToLogChannel(msg);
 
       if (eventPingedKeys.size > 500) {
