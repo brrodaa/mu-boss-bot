@@ -79,6 +79,8 @@ let logMessage      = null;
 
 let lastStackFingerprint = "";
 let repinInProgress      = false;
+// FIX: safety timeout handle so repinInProgress can never stay stuck forever
+let repinTimeoutHandle   = null;
 
 const BOT_START_TIME   = Date.now();
 const STARTUP_GRACE_MS = 30 * 1000;
@@ -446,7 +448,7 @@ async function forwardToLogChannel(content) {
 // =====================
 // @EVERYONE WARNINGS
 // =====================
-async function postEveryoneWarning(channel, key, content) {
+async function postEveryoneWarning(channel, key, content, lifespanMs = EVERYONE_WARNING_LIFESPAN_MS) {
   await clearEveryoneWarning(key);
 
   let msg;
@@ -454,13 +456,17 @@ async function postEveryoneWarning(channel, key, content) {
   catch (err) { console.error("[Warning] Failed to post @everyone:", err.message ?? err); return; }
 
   forwardToLogChannel(content);
-  scheduleEveryoneWarningCycle(channel, key, content, msg);
+  scheduleEveryoneWarningCycle(channel, key, content, msg, lifespanMs);
 }
 
-function scheduleEveryoneWarningCycle(channel, key, content, msg) {
-  const repinDelay = EVERYONE_WARNING_LIFESPAN_MS - EVERYONE_REPIN_BEFORE_EXPIRE_MS;
+function scheduleEveryoneWarningCycle(channel, key, content, msg, lifespanMs = EVERYONE_WARNING_LIFESPAN_MS) {
+  // Only schedule a repin if there is enough time left before expiry.
+  // If lifespanMs <= EVERYONE_REPIN_BEFORE_EXPIRE_MS (e.g. the 5-min warning
+  // with a 5-min lifespan), repinDelay would be zero or negative, so we skip
+  // the repin entirely and just let the message delete itself on expiry.
+  const repinDelay = lifespanMs - EVERYONE_REPIN_BEFORE_EXPIRE_MS;
 
-  const repinTimer = setTimeout(async () => {
+  const repinTimer = repinDelay > 0 ? setTimeout(async () => {
     try {
       if (!everyoneWarnings[key]) return;
       everyoneWarnings[key].msg.delete().catch(() => {});
@@ -470,18 +476,18 @@ function scheduleEveryoneWarningCycle(channel, key, content, msg) {
       catch { delete everyoneWarnings[key]; return; }
 
       everyoneWarnings[key].msg = newMsg;
-      scheduleEveryoneWarningCycle(channel, key, content, newMsg);
+      scheduleEveryoneWarningCycle(channel, key, content, newMsg, lifespanMs);
     } catch (err) {
       console.error("[Warning] repinTimer error:", err.message ?? err);
       delete everyoneWarnings[key];
     }
-  }, repinDelay);
+  }, repinDelay) : null;
 
   const deleteTimer = setTimeout(() => {
     if (!everyoneWarnings[key]) return;
     everyoneWarnings[key].msg.delete().catch(() => {});
     delete everyoneWarnings[key];
-  }, EVERYONE_WARNING_LIFESPAN_MS);
+  }, lifespanMs);
 
   everyoneWarnings[key] = { msg, content, repinTimer, deleteTimer };
 }
@@ -489,7 +495,7 @@ function scheduleEveryoneWarningCycle(channel, key, content, msg) {
 async function clearEveryoneWarning(key) {
   const w = everyoneWarnings[key];
   if (!w) return;
-  clearTimeout(w.repinTimer);
+  if (w.repinTimer) clearTimeout(w.repinTimer);
   clearTimeout(w.deleteTimer);
   w.msg.delete().catch(() => {});
   delete everyoneWarnings[key];
@@ -580,6 +586,16 @@ function computeStackFingerprint() {
 async function fullRepin(channel) {
   if (repinInProgress) return;
   repinInProgress = true;
+
+  // FIX: safety valve — if repin hangs for any reason, unlock after 30s so
+  // the next tick can try again rather than freezing the bot forever
+  if (repinTimeoutHandle) clearTimeout(repinTimeoutHandle);
+  repinTimeoutHandle = setTimeout(() => {
+    if (repinInProgress) {
+      console.warn("[Repin] Safety timeout fired — releasing repinInProgress lock");
+      repinInProgress = false;
+    }
+  }, 30 * 1000);
 
   try {
     const now = Date.now();
@@ -672,6 +688,7 @@ async function fullRepin(channel) {
     console.error("[Repin] Error:", err.message ?? err);
   } finally {
     repinInProgress = false;
+    if (repinTimeoutHandle) { clearTimeout(repinTimeoutHandle); repinTimeoutHandle = null; }
   }
 }
 
@@ -738,6 +755,8 @@ async function tickMissedWindowMessages(channel) {
     const untilStart = w.nextWindowStart - now;
     const untilEnd   = w.nextWindowEnd   - now;
 
+    // FIX: pingedStart now only sends ONE message when window opens.
+    // Removed the redundant channel.send() that was duplicating the @everyone ping.
     if (!w.pingedStart && untilStart <= 0 && untilEnd > 0) {
       w.pingedStart = true;
       const tsClose = Math.floor(w.nextWindowEnd / 1000);
@@ -745,25 +764,24 @@ async function tickMissedWindowMessages(channel) {
         `@everyone 🔶 **${w.boss.name}** missed window is now open! ` +
         `Window closes in **${format(untilEnd)}** — ${toServerTimeStr(w.nextWindowEnd)} (server) — <t:${tsClose}:t> (your time)\n` +
         `⚠️ Timer might be incorrect — boss may take longer to respawn.`;
-      channel.send(content);
-      forwardToLogChannel(content);
+      postEveryoneWarning(channel, `${id}_missed_start`, content);
     }
 
+    // FIX: these two pings are now routed through postEveryoneWarning so they
+    // replace each other rather than stacking, and use keyed deduplication.
     if (!w.pinged1h && untilEnd > 0 && untilEnd <= 60 * 60 * 1000) {
       w.pinged1h = true;
       const content =
         `@everyone ⏳ **${w.boss.name}** missed-window: **1 hour remaining** in the spawn window!\n` +
         `⚠️ This timer might be incorrect.`;
-      channel.send(content);
-      forwardToLogChannel(content);
+      postEveryoneWarning(channel, `${id}_missed_1h`, content);
     }
 
     if (!w.pinged20min && untilEnd > 0 && untilEnd <= 20 * 60 * 1000) {
       w.pinged20min = true;
       const content =
         `@everyone ⚠️ **${w.boss.name}** missed-window: **20 minutes remaining** in the spawn window!`;
-      channel.send(content);
-      forwardToLogChannel(content);
+      postEveryoneWarning(channel, `${id}_missed_20min`, content);
     }
   }
 }
@@ -890,15 +908,23 @@ function buildButtons() {
 function startLoop() {
   setInterval(async () => {
     try {
-      if (!dashboardMessage) return;
-      const channel = dashboardMessage.channel;
+      // FIX: if dashboardMessage is null, still allow fullRepin to recover it
+      // by fetching the channel directly instead of bailing out immediately.
+      // We only skip if we have no way to know which channel to use.
+      const channel = dashboardMessage
+        ? dashboardMessage.channel
+        : await client.channels.fetch(CHANNEL_ID).catch(() => null);
+
+      if (!channel) return;
 
       await tickMissedWindowMessages(channel);
 
       const currentFingerprint = computeStackFingerprint();
-      if (currentFingerprint !== lastStackFingerprint) {
+      if (currentFingerprint !== lastStackFingerprint || !dashboardMessage) {
         await fullRepin(channel);
       }
+
+      if (!dashboardMessage) return;
 
       await Promise.all([
         dashboardMessage.edit({ embeds: [buildEmbed()], components: buildButtons() })
@@ -965,28 +991,36 @@ function checkWarnings(channel) {
 
     const w = spawnWarnings[b.id];
 
-    // 5 min before respawn
+    // 5 min before respawn — only fires while boss is still on cooldown
+    // and there is no active missed-window card for this boss
     if (cooldown > 0 && cooldown <= 5 * 60 * 1000 && !w.warned5) {
       w.warned5 = true;
       if (!missedWindowMessages[b.id]) {
-        postEveryoneWarning(channel, `${b.id}_5min`, `@everyone ⏳ **${b.name}** spawns in 5 minutes`);
+        // Lifespan = cooldown remaining (≤5 min) so the message deletes itself
+        // right as the window opens and the repin cycle never has time to fire.
+        postEveryoneWarning(channel, `${b.id}_5min`, `@everyone ⏳ **${b.name}** spawns in 5 minutes`, Math.max(cooldown, 0));
       }
     }
 
-    // 20 min left in window — fires 40min after window opens, never at open time
-    if (cooldown <= 0 && windowLeft > 0 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
-      w.warned20 = true;
-      postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** spawn window closes in 20 minutes!`);
-    }
-
-    // Window just opened — post green card and immediately kill the 5min ping
-    // so its 9-minute repin can never fire inside the open window
+    // Window just opened — post green spawn-window card and kill the 5-min ping.
+    // warned20 is intentionally NOT fired here; the green card itself signals
+    // the window is open. The only additional ping inside an active window is
+    // the 20-min-remaining one below, which fires once near the end.
     if (cooldown <= 0 && windowLeft > 0 && !w.windowCreated) {
       w.windowCreated = true;
+      // _5min warning already expired naturally (lifespan = cooldown at fire time).
+      // Clear it defensively in case of edge-case timing.
       clearEveryoneWarning(`${b.id}_5min`);
       if (!missedWindowMessages[b.id]) {
         createSpawnWindow(b, b.id, channel, windowEnd);
       }
+    }
+
+    // 20 min remaining in window — fires only once, only near the END of the
+    // window, never at open time (guarded by windowLeft <= 20min).
+    if (cooldown <= 0 && windowLeft > 0 && windowLeft <= 20 * 60 * 1000 && !w.warned20) {
+      w.warned20 = true;
+      postEveryoneWarning(channel, `${b.id}_20min`, `@everyone ⚠️ **${b.name}** spawn window closes in 20 minutes!`);
     }
 
     if (
@@ -1016,6 +1050,10 @@ function clearBossCards(id) {
   }
   clearEveryoneWarning(`${id}_5min`);
   clearEveryoneWarning(`${id}_20min`);
+  // FIX: also clear the missed-window warning keys when a boss card is cleared
+  clearEveryoneWarning(`${id}_missed_start`);
+  clearEveryoneWarning(`${id}_missed_1h`);
+  clearEveryoneWarning(`${id}_missed_20min`);
 }
 
 // =====================
