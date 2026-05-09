@@ -471,7 +471,6 @@ async function postEveryoneWarning(channel, key, content, lifespanMs = EVERYONE_
   try { msg = await channel.send({ content }); }
   catch (err) { console.error("[Warning] Failed to post @everyone:", err.message ?? err); return; }
 
-  forwardToLogChannel(content);
   scheduleEveryoneWarningCycle(channel, key, content, msg, lifespanMs);
 }
 
