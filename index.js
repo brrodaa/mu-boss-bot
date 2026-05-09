@@ -975,7 +975,7 @@ async function checkFixedEvents(channel) {
       const warnMs    = ev.warnMinutes * 60 * 1000;
       const timeUntil = eventMs - now;
 
-      if (timeUntil > warnMs + TICK_RATE || timeUntil < -TICK_RATE) continue;
+      if (timeUntil > warnMs + (3 * 60 * 1000) || timeUntil < -(3 * 60 * 1000)) continue;
 
       const eventDate = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
       const key       = `${ev.name}|${hhmm}|${eventDate}`;
