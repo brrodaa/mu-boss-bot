@@ -197,6 +197,31 @@ function save() {
 }
 
 // =====================
+// RESTORE WARNING FLAGS ON STARTUP
+// Pre-sets spawnWarnings flags based on current time so restarts
+// never re-fire warnings that already went out in a previous session.
+// =====================
+function restoreSpawnWarningFlags() {
+  const now = Date.now();
+  for (const b of BOSSES) {
+    const e = data.kills[b.id];
+    if (!e) {
+      spawnWarnings[b.id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
+      continue;
+    }
+    const cooldown  = e.respawnTime - now;
+    const windowEnd = e.respawnTime + 60 * 60 * 1000;
+    spawnWarnings[b.id] = {
+      warned5:       cooldown <= 5 * 60 * 1000,
+      warned20:      cooldown <= 0 && (windowEnd - now) <= 20 * 60 * 1000,
+      windowCreated: cooldown <= 0,
+      missedHandled: now > windowEnd,
+    };
+  }
+  console.log("[Startup] Spawn warning flags restored from current timer state.");
+}
+
+// =====================
 // REDEPLOY RECOVERY
 // =====================
 async function recoverFromDiscordBackup() {
@@ -989,7 +1014,7 @@ async function checkFixedEvents(channel) {
       // Track from (warnMs + 10min) so even if a tick is late we still catch it.
       // Key deduplication ensures only one ping per event occurrence.
       // Late ticks show actual remaining minutes instead of the configured warnMinutes.
-      if (timeUntil > warnMs + (1 * 60 * 1000) || timeUntil < -(4 * 60 * 1000)) continue;
+      if (timeUntil > warnMs + (1 * 60 * 1000) || timeUntil < -TICK_RATE) continue;
 
       const eventDate = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
       const key       = `${ev.name}|${hhmm}|${eventDate}`;
@@ -1051,6 +1076,9 @@ client.once(Events.ClientReady, async () => {
 
   if (await recoverFromDiscordBackup())
     console.log("[Recovery] Timers restored.");
+
+  // Restore warning flags so restarts don't re-fire already-sent warnings
+  restoreSpawnWarningFlags();
 
   const channel = await client.channels.fetch(CHANNEL_ID);
 
