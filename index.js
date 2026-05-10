@@ -404,6 +404,18 @@ function format(ms) {
   return h > 0 ? `${h}h ${m % 60}m` : `${m}m`;
 }
 
+// Format with seconds — used for spawn window countdown (refreshes every tick)
+function formatSeconds(ms) {
+  if (ms <= 0) return "NOW";
+  const totalSec = Math.floor(ms / 1000);
+  const s = totalSec % 60;
+  const m = Math.floor(totalSec / 60) % 60;
+  const h = Math.floor(totalSec / 3600);
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 // =====================
 // LOGGING
 // =====================
@@ -521,7 +533,7 @@ function buildSpawnWindowEmbed(boss, windowStart, windowEnd) {
   const tsStart   = Math.floor(windowStart / 1000);
   const tsEnd     = Math.floor(windowEnd / 1000);
   const desc = remaining > 0
-    ? `⏳ Time left: **${format(remaining)}**\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closes: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
+    ? `⏳ Time left: **${formatSeconds(remaining)}**\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closes: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
     : `⌛ Window has closed — log the kill or wait for next respawn\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closed: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`;
   return new EmbedBuilder()
     .setTitle(`🟢 ${boss.name} — Spawn window active`)
@@ -974,17 +986,22 @@ async function checkFixedEvents(channel) {
       const warnMs    = ev.warnMinutes * 60 * 1000;
       const timeUntil = eventMs - now;
 
-      if (timeUntil > warnMs + (3 * 60 * 1000) || timeUntil < -(3 * 60 * 1000)) continue;
+      // Track from (warnMs + 10min) so even if a tick is late we still catch it.
+      // Key deduplication ensures only one ping per event occurrence.
+      // Late ticks show actual remaining minutes instead of the configured warnMinutes.
+      if (timeUntil > warnMs + (1 * 60 * 1000) || timeUntil < -(4 * 60 * 1000)) continue;
 
       const eventDate = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
       const key       = `${ev.name}|${hhmm}|${eventDate}`;
       if (eventPingedKeys.has(key)) continue;
       eventPingedKeys.add(key);
 
+      // Use actual remaining time so a late tick says "8 minutes" not wrong "10 minutes"
+      const actualMins   = Math.max(1, Math.round(timeUntil / 60000));
       const eventTimeStr = toServerTimeStr(eventMs);
       const tsEvent      = Math.floor(eventMs / 1000);
       let msg =
-        `@everyone ⏰ **${ev.name}** starts in **${ev.warnMinutes} minutes**!\n` +
+        `@everyone ⏰ **${ev.name}** starts in **${actualMins} minute${actualMins !== 1 ? "s" : ""}**!\n` +
         `🕒 ${eventTimeStr} (server time) — <t:${tsEvent}:t> (your local time)`;
       if (ev.extraNote) msg += `\n${ev.extraNote}`;
 
