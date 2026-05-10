@@ -102,7 +102,7 @@ const TRACKED_BOSS_TYPES = new Set(["kharzul", "vescrya"]);
 // FIXED EVENTS
 // =====================
 const FIXED_EVENTS = [
-  { name: "🟡 Golden Invasion",   times: ["00:36","04:36","08:36","12:36","16:36","20:36"], warnMinutes: 5 },
+  { name: "🟡 Golden Invasion",   times: ["00:31","04:31","08:31","12:31","16:31","20:31"], warnMinutes: 5 },
   { name: "🧙 White Wizard",      times: ["09:45","12:45","15:45","18:45"],                 warnMinutes: 5 },
   { name: "💀 Death King",        times: ["21:45","00:45","03:45","06:45"],                 warnMinutes: 5 },
   { name: "⚡ Zaikan",            times: ["00:55","06:55","12:55","18:55"],                 warnMinutes: 5 },
