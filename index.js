@@ -70,6 +70,7 @@ let undoStack = [];
 let backupMessage = null;
 let logMessage    = null;
 
+let missedCount      = {}; // tracks auto-advance count per boss id
 let repinInProgress  = false;
 let lastBackupRepost = 0;
 const BACKUP_REPOST_COOLDOWN_MS = 60 * 1000;
@@ -602,19 +603,41 @@ function buildEmbed() {
 
   const bosses = BOSSES.map(b => {
     const e = data.kills[b.id];
-    if (!e) return { name: b.name, timeLeft: 0, text: "🟢 READY\n👤 None", isBroken: false };
+    if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY
+👤 None`, isBroken: false };
 
-    const cooldown   = e.respawnTime - now;
-    const windowEnd  = e.respawnTime + 60 * 60 * 1000;
-    const windowLeft = windowEnd - now;
-    let text, isBroken = false;
+    const cooldown      = e.respawnTime - now;
+    const windowEnd     = e.respawnTime + 60 * 60 * 1000;
+    const windowLeft    = windowEnd - now;
+    const isMissed      = !!missedWindowMessages[b.id];
+    const missedTimes   = missedCount[b.id] || 0;
+    const missedLabel   = missedTimes >= 2
+      ? `⚠️ Timer wrong (${missedTimes}x missed) — update manually!`
+      : `⚠️ Timer possibly wrong (1st miss)`;
+    let text, isBroken  = false;
 
     if (cooldown > 0) {
       const tsRespawn = Math.floor(e.respawnTime / 1000);
-      text = `🔴 ${format(cooldown)}\n🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
+      if (isMissed) {
+        const missedNote = missedTimes >= 2 ? `🚨 Missed ${missedTimes}x in a row — probably needs update manually!` : `1st missed window — timer may be off`;
+        text = [
+          `⚠️ Timer possibly wrong — waiting for respawn`,
+          missedNote,
+          `🕒 Expected: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
+          `⏳ Time left: ${format(cooldown)}`,
+          `👤 Last updated by: ${e.lastKiller}`,
+        ].join('\n');
+        isBroken = true;
+      } else {
+        text = `🔴 ${format(cooldown)}
+🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)
+👤 ${e.lastKiller}`;
+      }
     } else if (windowLeft > 0) {
       const tsRespawn = Math.floor(e.respawnTime / 1000);
-      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
+      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}
+🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)
+👤 ${e.lastKiller}`;
     } else {
       const nextWindowOpen  = e.respawnTime + 60 * 60 * 1000;
       const nextWindowClose = e.respawnTime + 2 * 60 * 60 * 1000;
@@ -622,14 +645,15 @@ function buildEmbed() {
       const tsOpen    = Math.floor(nextWindowOpen  / 1000);
       const tsClose   = Math.floor(nextWindowClose / 1000);
       const nextLine  = nextWindowClose > now
-        ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)\n    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
+        ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)
+    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
         : `🔄 Next window also passed — update manually`;
       text = [
-        `⚠️ Timer possibly wrong`,
+        missedLabel,
         `🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
         nextLine,
         `👤 Last updated by: ${e.lastKiller}`,
-      ].join("\n");
+      ].join('\n');
       isBroken = true;
     }
 
@@ -737,13 +761,19 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
 async function handleMissedWindow(boss, id, channel) {
   const e = data.kills[id];
   if (!e) return;
-  console.log(`[MissedWindow] No kill for ${boss.name} — auto-advancing 7h`);
+
+  // Track how many times this boss has been auto-advanced
+  missedCount[id] = (missedCount[id] || 0) + 1;
+  const count = missedCount[id];
+
+  console.log(`[MissedWindow] No kill for ${boss.name} — auto-advancing 7h (advance #${count})`);
   snapshot();
   e.respawnTime = e.respawnTime + 7 * 60 * 60 * 1000;
   e.killTime    = e.respawnTime - 7 * 60 * 60 * 1000;
   save();
   spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
   clearBossCards(id);
+
   const nextWindowStart = e.respawnTime;
   const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
   missedWindowMessages[id] = {
@@ -751,6 +781,22 @@ async function handleMissedWindow(boss, id, channel) {
     nextWindowStart, nextWindowEnd,
     pingedStart: false, pinged1h: false, pinged20min: false, boss,
   };
+
+  // On the 2nd+ auto-advance, fire a special @everyone alert so the team
+  // knows to look for the boss in the world and update the timer manually.
+  if (count >= 2) {
+    const tsOpen  = Math.floor(nextWindowStart / 1000);
+    const tsClose = Math.floor(nextWindowEnd   / 1000);
+    const content =
+      `@everyone 🚨 **${boss.name}** has missed its spawn window **${count} times** in a row!
+` +
+      `The timer is likely wrong — please find and kill the boss to reset it.
+` +
+      `📍 Next estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)
+` +
+      `<t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`;
+    postEveryoneWarning(channel, `${id}_stale_timer`, content, 30 * 60 * 1000);
+  }
 }
 
 // =====================
@@ -933,6 +979,7 @@ async function checkFixedEvents(channel) {
 // CLEANUP HELPER
 // =====================
 function clearBossCards(id) {
+  missedCount[id] = 0; // reset on any kill or manual set
   if (spawnWindowMessages[id]) {
     clearTimeout(spawnWindowMessages[id].deleteTimer);
     if (spawnWindowMessages[id].msg) spawnWindowMessages[id].msg.delete().catch(() => {});
