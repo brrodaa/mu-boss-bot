@@ -113,6 +113,32 @@ const FIXED_EVENTS = [
   { name: "🐇 Lunar Rabbit",      times: ["05:25","11:25","17:25","23:25"], warnMinutes: 5 },
   { name: "🔥 Fire Flame",        times: ["01:25","07:25","13:25","19:25"], warnMinutes: 5 },
   { name: "🎁 Pouch of Blessing", times: ["03:25","09:25","15:25","21:25"], warnMinutes: 5 },
+
+  // ── Fixed-Respawn World Bosses ──
+  {
+    name: "👹 Abaddon",
+    times: ["03:50","17:50"],
+    warnMinutes: 5,
+    extraNote: "📍 Location: **Twisted Karutan** | 🎁 Drop: Armor Sets, Weapons",
+  },
+  {
+    name: "💀 Lord Kundun",
+    times: ["01:50","15:50"],
+    warnMinutes: 5,
+    extraNote: "📍 Location: **Shadow Abyss** | 🎁 Drop: Weapons",
+  },
+  {
+    name: "🔥 Infernal Overlord",
+    times: ["04:50","20:50"],
+    warnMinutes: 5,
+    extraNote: "📍 Location: **Kanturu Labyrinth** | 🎁 Drop: Armor Sets",
+  },
+  {
+    name: "🪽 Aurindra",
+    times: ["23:50"],
+    warnMinutes: 5,
+    extraNote: "📍 Location: **Crimson Icarus** | 🎁 Drop: Wing 2, Phoenix Feather, Wing 2.5",
+  },
 ];
 
 const eventPingedKeys = new Set();
@@ -603,8 +629,7 @@ function buildEmbed() {
 
   const bosses = BOSSES.map(b => {
     const e = data.kills[b.id];
-    if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY
-👤 None`, isBroken: false };
+    if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY\n👤 None`, isBroken: false };
 
     const cooldown      = e.respawnTime - now;
     const windowEnd     = e.respawnTime + 60 * 60 * 1000;
@@ -629,15 +654,11 @@ function buildEmbed() {
         ].join('\n');
         isBroken = true;
       } else {
-        text = `🔴 ${format(cooldown)}
-🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)
-👤 ${e.lastKiller}`;
+        text = `🔴 ${format(cooldown)}\n🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
       }
     } else if (windowLeft > 0) {
       const tsRespawn = Math.floor(e.respawnTime / 1000);
-      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}
-🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)
-👤 ${e.lastKiller}`;
+      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
     } else {
       const nextWindowOpen  = e.respawnTime + 60 * 60 * 1000;
       const nextWindowClose = e.respawnTime + 2 * 60 * 60 * 1000;
@@ -645,8 +666,7 @@ function buildEmbed() {
       const tsOpen    = Math.floor(nextWindowOpen  / 1000);
       const tsClose   = Math.floor(nextWindowClose / 1000);
       const nextLine  = nextWindowClose > now
-        ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)
-    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
+        ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)\n    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
         : `🔄 Next window also passed — update manually`;
       text = [
         missedLabel,
@@ -788,12 +808,9 @@ async function handleMissedWindow(boss, id, channel) {
     const tsOpen  = Math.floor(nextWindowStart / 1000);
     const tsClose = Math.floor(nextWindowEnd   / 1000);
     const content =
-      `@everyone 🚨 **${boss.name}** has missed its spawn window **${count} times** in a row!
-` +
-      `The timer is likely wrong — please find and kill the boss to reset it.
-` +
-      `📍 Next estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)
-` +
+      `@everyone 🚨 **${boss.name}** has missed its spawn window **${count} times** in a row!\n` +
+      `The timer is likely wrong — please find and kill the boss to reset it.\n` +
+      `📍 Next estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)\n` +
       `<t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`;
     postEveryoneWarning(channel, `${id}_stale_timer`, content, 30 * 60 * 1000);
   }
