@@ -70,7 +70,7 @@ let undoStack = [];
 let backupMessage = null;
 let logMessage    = null;
 
-let missedCount      = {};
+let missedCount      = {}; // tracks auto-advance count per boss id
 let repinInProgress  = false;
 let lastBackupRepost = 0;
 const BACKUP_REPOST_COOLDOWN_MS = 60 * 1000;
@@ -81,38 +81,17 @@ const STARTUP_GRACE_MS = 30 * 1000;
 // =====================
 // BOSSES
 // =====================
-const HOUR = 60 * 60 * 1000;
-
 function buildBosses() {
   const bosses = [];
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `lorencia_${i}`,  name: `Kharzul #${i}`,         type: "kharzul" });
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `davias_${i}`,    name: `Vescrya #${i}`,          type: "vescrya" });
-  for (let i = 1; i <= 2; i++) bosses.push({ id: `crywolf_${i}`,   name: `Muggron #${i} Crywolf`,  type: "muggron" });
-  for (let i = 1; i <= 2; i++) bosses.push({ id: `barracks_${i}`,  name: `Muggron #${i} Barracks`, type: "muggron" });
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `borgar_${i}`,    name: `Borgar S${i}`,           type: "borgar" });
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `dreadhorn_${i}`, name: `Dreadhorn S${i}`,        type: "dreadhorn" });
-  for (let i = 1; i <= 3; i++) bosses.push({ id: `moltragon_${i}`, name: `Moltragon S${i}`,        type: "moltragon" });
+  for (let i = 1; i <= 3; i++) bosses.push({ id: `lorencia_${i}`, name: `Kharzul #${i}`,         type: "kharzul" });
+  for (let i = 1; i <= 3; i++) bosses.push({ id: `davias_${i}`,   name: `Vescrya #${i}`,          type: "vescrya" });
+  for (let i = 1; i <= 2; i++) bosses.push({ id: `crywolf_${i}`,  name: `Muggron #${i} Crywolf`,  type: "muggron" });
+  for (let i = 1; i <= 2; i++) bosses.push({ id: `barracks_${i}`, name: `Muggron #${i} Barracks`, type: "muggron" });
   return bosses;
 }
 const BOSSES = buildBosses();
 
-const TRACKED_BOSS_TYPES = new Set(["kharzul", "vescrya", "borgar", "dreadhorn", "moltragon"]);
-
-const BOSS_CONFIG = {
-  kharzul:   { respawnMs: 7 * HOUR, windowMs: HOUR, missedWindowMs: 2 * HOUR, maxMissed: Infinity },
-  vescrya:   { respawnMs: 7 * HOUR, windowMs: HOUR, missedWindowMs: 2 * HOUR, maxMissed: Infinity },
-  muggron:   { respawnMs: 7 * HOUR, windowMs: HOUR, missedWindowMs: 0,        maxMissed: 0 },
-  borgar:    { respawnMs: 2 * HOUR, windowMs: HOUR, missedWindowMs: HOUR,     maxMissed: 2 },
-  dreadhorn: { respawnMs: 1 * HOUR, windowMs: HOUR, missedWindowMs: HOUR,     maxMissed: 2 },
-  moltragon: { respawnMs: 1 * HOUR, windowMs: HOUR, missedWindowMs: HOUR,     maxMissed: 2 },
-};
-
-const MENU_BOSS_TYPES = new Set(["borgar", "dreadhorn", "moltragon"]);
-
-function getConfig(bossId) {
-  const boss = BOSSES.find(b => b.id === bossId);
-  return BOSS_CONFIG[boss?.type] || BOSS_CONFIG.kharzul;
-}
+const TRACKED_BOSS_TYPES = new Set(["kharzul", "vescrya"]);
 
 // =====================
 // FIXED EVENTS
@@ -212,6 +191,8 @@ function save() {
 
 // =====================
 // RESTORE WARNING FLAGS ON STARTUP
+// Pre-sets all warning flags so a restart never re-fires @everyone pings
+// that already went out in a previous session.
 // =====================
 function restoreSpawnWarningFlags() {
   const now = Date.now();
@@ -223,11 +204,12 @@ function restoreSpawnWarningFlags() {
       continue;
     }
 
-    const config        = getConfig(b.id);
     const cooldown      = e.respawnTime - now;
-    const windowEnd     = e.respawnTime + config.windowMs;
+    const windowEnd     = e.respawnTime + 60 * 60 * 1000;
     const windowExpired = now > windowEnd;
 
+    // warned5: true whenever we are within 5 min of respawn OR past it.
+    // This covers restarts during the last-5-min countdown window.
     spawnWarnings[b.id] = {
       warned5:       cooldown <= 5 * 60 * 1000,
       warned20:      cooldown <= 0 && (windowEnd - now) <= 20 * 60 * 1000,
@@ -235,9 +217,12 @@ function restoreSpawnWarningFlags() {
       missedHandled: windowExpired,
     };
 
+    // After handleMissedWindow auto-advances, e.respawnTime is the NEW respawnTime.
+    // The missed window opens AT that new respawnTime and closes 2h later.
+    // Restore the entry with flags pre-set so tickMissedWindowPings doesn't re-fire.
     if (windowExpired && TRACKED_BOSS_TYPES.has(b.type)) {
       const nextWindowStart = e.respawnTime;
-      const nextWindowEnd   = e.respawnTime + config.missedWindowMs;
+      const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
       const untilEnd        = nextWindowEnd - now;
 
       if (untilEnd + WINDOW_GRACE_MS > 0) {
@@ -269,7 +254,7 @@ async function recoverFromDiscordBackup() {
     (() => {
       try {
         const d = JSON.parse(fs.readFileSync("data.json", "utf8"));
-        return !d.kills || Object.values(d.kills).every(e => e.respawnTime < now - 8 * HOUR);
+        return !d.kills || Object.values(d.kills).every(e => e.respawnTime < now - 2 * 60 * 60 * 1000);
       } catch { return true; }
     })();
 
@@ -300,7 +285,7 @@ async function recoverFromDiscordBackup() {
 
     const filtered = {};
     for (const [id, entry] of Object.entries(json.kills)) {
-      if (entry.respawnTime >= now - 8 * HOUR) filtered[id] = entry;
+      if (entry.respawnTime >= now - 8 * 60 * 60 * 1000) filtered[id] = entry;
     }
 
     data = { kills: filtered };
@@ -316,7 +301,7 @@ async function recoverFromDiscordBackup() {
 // =====================
 // BACKUP — local files
 // =====================
-const BACKUP_INTERVAL_MS = HOUR;
+const BACKUP_INTERVAL_MS = 60 * 60 * 1000;
 const MAX_LOCAL_BACKUPS  = 48;
 
 function saveLocalBackup() {
@@ -526,6 +511,8 @@ async function postEveryoneWarning(channel, key, content, lifespanMs = EVERYONE_
 }
 
 function scheduleEveryoneWarningCycle(channel, key, content, msg, lifespanMs = EVERYONE_WARNING_LIFESPAN_MS) {
+  // No repin — reposting sends a second @everyone notification.
+  // Message stays until lifespan expires, then gets deleted and forwarded to log.
   const deleteTimer = setTimeout(() => {
     if (!everyoneWarnings[key]) return;
     everyoneWarnings[key].msg.delete().catch(() => {});
@@ -607,110 +594,6 @@ function buildMissedWindowComponents(id) {
 // =====================
 // DASHBOARD EMBED
 // =====================
-function buildDirectBossEntry(b, now) {
-  const e = data.kills[b.id];
-  if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY\n👤 None`, isBroken: false };
-
-  const config        = getConfig(b.id);
-  const cooldown      = e.respawnTime - now;
-  const windowEnd     = e.respawnTime + config.windowMs;
-  const windowLeft    = windowEnd - now;
-  const isMissed      = !!missedWindowMessages[b.id];
-  const missedTimes   = missedCount[b.id] || 0;
-  const missedLabel   = missedTimes >= 2
-    ? `⚠️ Timer wrong (${missedTimes}x missed) — update manually!`
-    : `⚠️ Timer possibly wrong (1st miss)`;
-  let text, isBroken  = false;
-
-  if (cooldown > 0) {
-    const tsRespawn = Math.floor(e.respawnTime / 1000);
-    if (isMissed) {
-      const missedNote = missedTimes >= 2 ? `🚨 Missed ${missedTimes}x in a row — probably needs update manually!` : `1st missed window — timer may be off`;
-      text = [
-        `⚠️ Timer possibly wrong — waiting for respawn`,
-        missedNote,
-        `🕒 Expected: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
-        `⏳ Time left: ${format(cooldown)}`,
-        `👤 Last updated by: ${e.lastKiller}`,
-      ].join('\n');
-      isBroken = true;
-    } else {
-      text = `🔴 ${format(cooldown)}\n🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
-    }
-  } else if (windowLeft > 0) {
-    const tsRespawn = Math.floor(e.respawnTime / 1000);
-    text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
-  } else {
-    const nextWindowOpen  = e.respawnTime + config.respawnMs;
-    const nextWindowClose = e.respawnTime + config.respawnMs + config.windowMs;
-    const tsRespawn = Math.floor(e.respawnTime       / 1000);
-    const tsOpen    = Math.floor(nextWindowOpen      / 1000);
-    const tsClose   = Math.floor(nextWindowClose     / 1000);
-    const nextLine  = nextWindowClose > now
-      ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)\n    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
-      : `🔄 Next window also passed — update manually`;
-    text = [
-      missedLabel,
-      `🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
-      nextLine,
-      `👤 Last updated by: ${e.lastKiller}`,
-    ].join('\n');
-    isBroken = true;
-  }
-
-  return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
-}
-
-function buildGroupedBossEntry(type, now) {
-  const typeBosses = BOSSES.filter(b => b.type === type);
-  const label      = type.charAt(0).toUpperCase() + type.slice(1);
-  const lines      = [];
-  let minTimeLeft  = Infinity;
-  let anyBroken    = false;
-
-  for (const b of typeBosses) {
-    const e          = data.kills[b.id];
-    const sLabel     = b.name.replace(/^\S+\s*/, "");
-
-    if (!e) {
-      lines.push(`**${sLabel}**: 🟢 READY`);
-      minTimeLeft = 0;
-      continue;
-    }
-
-    const cfg        = getConfig(b.id);
-    const cooldown   = e.respawnTime - now;
-    const windowEnd  = e.respawnTime + cfg.windowMs;
-    const windowLeft = windowEnd - now;
-    const isMissed   = !!missedWindowMessages[b.id];
-    const missedTimes = missedCount[b.id] || 0;
-    const tsRespawn  = Math.floor(e.respawnTime / 1000);
-    const timeLeft   = Math.max(cooldown, windowLeft);
-    if (timeLeft < minTimeLeft) minTimeLeft = timeLeft;
-
-    if (cooldown > 0) {
-      if (isMissed) {
-        anyBroken = true;
-        lines.push(`**${sLabel}**: ⚠️ ~${format(cooldown)} — <t:${tsRespawn}:t> — 👤 ${e.lastKiller}`);
-      } else {
-        lines.push(`**${sLabel}**: 🔴 ${format(cooldown)} — <t:${tsRespawn}:t> — 👤 ${e.lastKiller}`);
-      }
-    } else if (windowLeft > 0) {
-      lines.push(`**${sLabel}**: 🟢 WINDOW ${format(windowLeft)} — <t:${tsRespawn}:t> — 👤 ${e.lastKiller}`);
-    } else {
-      anyBroken = true;
-      if (missedTimes >= 2) {
-        lines.push(`**${sLabel}**: 🚨 Wrong (${missedTimes}x missed) — 👤 ${e.lastKiller}`);
-      } else {
-        lines.push(`**${sLabel}**: ⚠️ Missed — 👤 ${e.lastKiller}`);
-      }
-    }
-  }
-
-  if (minTimeLeft === Infinity) minTimeLeft = 0;
-  return { name: label, timeLeft: minTimeLeft, text: lines.join('\n'), isBroken: anyBroken };
-}
-
 function buildEmbed() {
   const now   = Date.now();
   const embed = new EmbedBuilder()
@@ -718,26 +601,72 @@ function buildEmbed() {
     .setColor(0xffaa00)
     .setFooter({ text: "Auto-updates every 15s" });
 
-  const entries = [];
+  const bosses = BOSSES.map(b => {
+    const e = data.kills[b.id];
+    if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY
+👤 None`, isBroken: false };
 
-  for (const b of BOSSES) {
-    if (!MENU_BOSS_TYPES.has(b.type)) entries.push(buildDirectBossEntry(b, now));
-  }
+    const cooldown      = e.respawnTime - now;
+    const windowEnd     = e.respawnTime + 60 * 60 * 1000;
+    const windowLeft    = windowEnd - now;
+    const isMissed      = !!missedWindowMessages[b.id];
+    const missedTimes   = missedCount[b.id] || 0;
+    const missedLabel   = missedTimes >= 2
+      ? `⚠️ Timer wrong (${missedTimes}x missed) — update manually!`
+      : `⚠️ Timer possibly wrong (1st miss)`;
+    let text, isBroken  = false;
 
-  const seenTypes = new Set();
-  for (const b of BOSSES) {
-    if (!MENU_BOSS_TYPES.has(b.type) || seenTypes.has(b.type)) continue;
-    seenTypes.add(b.type);
-    entries.push(buildGroupedBossEntry(b.type, now));
-  }
+    if (cooldown > 0) {
+      const tsRespawn = Math.floor(e.respawnTime / 1000);
+      if (isMissed) {
+        const missedNote = missedTimes >= 2 ? `🚨 Missed ${missedTimes}x in a row — probably needs update manually!` : `1st missed window — timer may be off`;
+        text = [
+          `⚠️ Timer possibly wrong — waiting for respawn`,
+          missedNote,
+          `🕒 Expected: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
+          `⏳ Time left: ${format(cooldown)}`,
+          `👤 Last updated by: ${e.lastKiller}`,
+        ].join('\n');
+        isBroken = true;
+      } else {
+        text = `🔴 ${format(cooldown)}
+🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)
+👤 ${e.lastKiller}`;
+      }
+    } else if (windowLeft > 0) {
+      const tsRespawn = Math.floor(e.respawnTime / 1000);
+      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}
+🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)
+👤 ${e.lastKiller}`;
+    } else {
+      const nextWindowOpen  = e.respawnTime + 60 * 60 * 1000;
+      const nextWindowClose = e.respawnTime + 2 * 60 * 60 * 1000;
+      const tsRespawn = Math.floor(e.respawnTime   / 1000);
+      const tsOpen    = Math.floor(nextWindowOpen  / 1000);
+      const tsClose   = Math.floor(nextWindowClose / 1000);
+      const nextLine  = nextWindowClose > now
+        ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)
+    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
+        : `🔄 Next window also passed — update manually`;
+      text = [
+        missedLabel,
+        `🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
+        nextLine,
+        `👤 Last updated by: ${e.lastKiller}`,
+      ].join('\n');
+      isBroken = true;
+    }
 
-  entries.sort((a, b) => {
+    return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
+  });
+
+  bosses.sort((a, b) => {
     if (a.isBroken && !b.isBroken) return 1;
     if (!a.isBroken && b.isBroken) return -1;
     return a.timeLeft - b.timeLeft;
   });
 
-  for (const e of entries) embed.addFields({ name: `• ${e.name}`, value: e.text });
+  for (const b of bosses) embed.addFields({ name: `• ${b.name}`, value: b.text });
   return embed;
 }
 
@@ -752,24 +681,12 @@ function chunk(arr, size) {
 
 function buildButtons() {
   const rows = [];
-  const directBosses = BOSSES.filter(b => !MENU_BOSS_TYPES.has(b.type));
-  for (const group of chunk(directBosses, 5)) {
+  for (const group of chunk(BOSSES, 5)) {
     const row = new ActionRowBuilder();
     for (const b of group)
       row.addComponents(new ButtonBuilder().setCustomId("kill_" + b.id).setLabel(b.name.slice(0, 20)).setStyle(ButtonStyle.Primary));
     rows.push(row);
   }
-
-  const menuTypes = [...new Set(BOSSES.filter(b => MENU_BOSS_TYPES.has(b.type)).map(b => b.type))];
-  if (menuTypes.length) {
-    const row = new ActionRowBuilder();
-    for (const type of menuTypes) {
-      const label = type.charAt(0).toUpperCase() + type.slice(1);
-      row.addComponents(new ButtonBuilder().setCustomId("newboss_" + type).setLabel(label).setStyle(ButtonStyle.Primary));
-    }
-    rows.push(row);
-  }
-
   rows.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("insert_time").setLabel("📝 Insert").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("reset_all").setLabel("🧹 Reset").setStyle(ButtonStyle.Danger),
@@ -826,8 +743,7 @@ async function repinDashboard(channel) {
 // =====================
 async function createSpawnWindow(boss, id, channel, windowEnd) {
   if (spawnWindowMessages[id]) return;
-  const config      = getConfig(id);
-  const windowStart = windowEnd - config.windowMs;
+  const windowStart = windowEnd - 60 * 60 * 1000;
   const msg = await channel.send({
     embeds: [buildSpawnWindowEmbed(boss, windowStart, windowEnd)],
     components: buildSpawnWindowComponents(id), flags: MessageFlags.SuppressNotifications
@@ -846,41 +762,38 @@ async function handleMissedWindow(boss, id, channel) {
   const e = data.kills[id];
   if (!e) return;
 
-  const config = BOSS_CONFIG[boss.type];
+  // Track how many times this boss has been auto-advanced
   missedCount[id] = (missedCount[id] || 0) + 1;
   const count = missedCount[id];
 
-  if (config.maxMissed !== Infinity && count > config.maxMissed) {
-    console.log(`[MissedWindow] ${boss.name} exceeded max missed (${config.maxMissed}), stopping auto-advance.`);
-    const content = `@everyone 🚨 **${boss.name}** timer is **stale** (${count} misses, max ${config.maxMissed}). Please find and kill the boss, then update the timer manually.`;
-    postEveryoneWarning(channel, `${id}_stale_timer`, content, 30 * 60 * 1000);
-    return;
-  }
-
-  const advanceHours = config.respawnMs / HOUR;
-  console.log(`[MissedWindow] No kill for ${boss.name} — auto-advancing ${advanceHours}h (advance #${count})`);
+  console.log(`[MissedWindow] No kill for ${boss.name} — auto-advancing 7h (advance #${count})`);
   snapshot();
-  e.respawnTime = e.respawnTime + config.respawnMs;
-  e.killTime    = e.respawnTime - config.respawnMs;
+  e.respawnTime = e.respawnTime + 7 * 60 * 60 * 1000;
+  e.killTime    = e.respawnTime - 7 * 60 * 60 * 1000;
   save();
   spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
   clearBossCards(id);
 
   const nextWindowStart = e.respawnTime;
-  const nextWindowEnd   = e.respawnTime + config.missedWindowMs;
+  const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
   missedWindowMessages[id] = {
     msg: null, deleteTimer: null,
     nextWindowStart, nextWindowEnd,
     pingedStart: false, pinged1h: false, pinged20min: false, boss,
   };
 
+  // On the 2nd+ auto-advance, fire a special @everyone alert so the team
+  // knows to look for the boss in the world and update the timer manually.
   if (count >= 2) {
     const tsOpen  = Math.floor(nextWindowStart / 1000);
     const tsClose = Math.floor(nextWindowEnd   / 1000);
     const content =
-      `@everyone 🚨 **${boss.name}** has missed its spawn window **${count} times** in a row!\n` +
-      `The timer is likely wrong — please find and kill the boss to reset it.\n` +
-      `📍 Next estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)\n` +
+      `@everyone 🚨 **${boss.name}** has missed its spawn window **${count} times** in a row!
+` +
+      `The timer is likely wrong — please find and kill the boss to reset it.
+` +
+      `📍 Next estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)
+` +
       `<t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`;
     postEveryoneWarning(channel, `${id}_stale_timer`, content, 30 * 60 * 1000);
   }
@@ -962,8 +875,7 @@ function tickMissedWindowPings(channel, now) {
       postEveryoneWarning(channel, `${id}_missed_start`, content);
     }
 
-    const windowDuration = w.nextWindowEnd - w.nextWindowStart;
-    if (!w.pinged1h && untilEnd > 0 && untilEnd <= 60 * 60 * 1000 && windowDuration > HOUR) {
+    if (!w.pinged1h && untilEnd > 0 && untilEnd <= 60 * 60 * 1000) {
       w.pinged1h = true;
       postEveryoneWarning(channel, `${id}_missed_1h`,
         `@everyone ⏳ **${w.boss.name}** missed-window: **1 hour remaining**!\n⚠️ This timer might be incorrect.`);
@@ -988,9 +900,8 @@ function checkWarnings(channel) {
     const e = data.kills[b.id];
     if (!e) continue;
 
-    const config                 = getConfig(b.id);
     const cooldown               = e.respawnTime - now;
-    const windowEnd              = e.respawnTime + config.windowMs;
+    const windowEnd              = e.respawnTime + 60 * 60 * 1000;
     const windowLeft             = windowEnd - now;
     const timeSinceWindowExpired = now - windowEnd;
 
@@ -1035,6 +946,7 @@ async function checkFixedEvents(channel) {
       const warnMs    = ev.warnMinutes * 60 * 1000;
       const timeUntil = eventMs - now;
 
+      // Window: (warnMs + 1min) before down to 1 tick after the warn time.
       if (timeUntil > warnMs + (1 * 60 * 1000) || timeUntil < -TICK_RATE) continue;
 
       const eventDate = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
@@ -1067,7 +979,7 @@ async function checkFixedEvents(channel) {
 // CLEANUP HELPER
 // =====================
 function clearBossCards(id) {
-  missedCount[id] = 0;
+  missedCount[id] = 0; // reset on any kill or manual set
   if (spawnWindowMessages[id]) {
     clearTimeout(spawnWindowMessages[id].deleteTimer);
     if (spawnWindowMessages[id].msg) spawnWindowMessages[id].msg.delete().catch(() => {});
@@ -1083,7 +995,6 @@ function clearBossCards(id) {
   clearEveryoneWarning(`${id}_missed_start`);
   clearEveryoneWarning(`${id}_missed_1h`);
   clearEveryoneWarning(`${id}_missed_20min`);
-  clearEveryoneWarning(`${id}_stale_timer`);
 }
 
 // =====================
@@ -1095,6 +1006,7 @@ client.once(Events.ClientReady, async () => {
 
   if (await recoverFromDiscordBackup()) console.log("[Recovery] Timers restored.");
 
+  // Must run after load/recovery — prevents all @everyone warnings from re-firing on restart
   restoreSpawnWarningFlags();
 
   const channel = await client.channels.fetch(CHANNEL_ID);
@@ -1123,46 +1035,13 @@ client.on(Events.InteractionCreate, async interaction => {
     repostBackupToBottom();
   }
 
-  // ── KILL BUTTON (direct-kill bosses) ──
+  // ── KILL BUTTON ──
   if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
     snapshot();
     const id = interaction.customId.replace("kill_", "");
     const boss = BOSSES.find(b => b.id === id);
     const now = Date.now();
-    const respawnTime = now + getConfig(id).respawnMs;
-    data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
-    save();
-    log(interaction.user, `KILLED ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
-    spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
-    clearBossCards(id);
-    await announceKill(interaction.channel, interaction.user, `killed **${boss.name}**`,
-      `🕒 Kill: ${toServerDateTimeStr(now)} — 🔄 Respawn: ${toServerDateTimeStr(respawnTime)}`);
-    return interaction.deferUpdate();
-  }
-
-  // ── NEW BOSS BUTTON → server select menu ──
-  if (interaction.isButton() && interaction.customId.startsWith("newboss_")) {
-    const type = interaction.customId.replace("newboss_", "");
-    const label = type.charAt(0).toUpperCase() + type.slice(1);
-    const servers = BOSSES.filter(b => b.type === type);
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId("newboss_server_" + type)
-      .setPlaceholder("Select server")
-      .addOptions(servers.map(b => ({ label: b.name, value: b.id })));
-    return interaction.reply({
-      content: `⚔️ Which server did you kill **${label}** on?`,
-      components: [new ActionRowBuilder().addComponents(menu)],
-      flags: MessageFlags.Ephemeral
-    });
-  }
-
-  // ── NEW BOSS SERVER SELECT → auto-record kill ──
-  if (interaction.isStringSelectMenu() && interaction.customId.startsWith("newboss_server_")) {
-    snapshot();
-    const id = interaction.values[0];
-    const boss = BOSSES.find(b => b.id === id);
-    const now = Date.now();
-    const respawnTime = now + getConfig(id).respawnMs;
+    const respawnTime = now + 7 * 60 * 60 * 1000;
     data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `KILLED ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
@@ -1179,7 +1058,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const id = interaction.customId.replace("window_kill_", "");
     const boss = BOSSES.find(b => b.id === id);
     const now = Date.now();
-    const respawnTime = now + getConfig(id).respawnMs;
+    const respawnTime = now + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1209,7 +1088,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const boss = BOSSES.find(b => b.id === id);
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
     const kill = parseServerTime(h, m);
-    const respawnTime = kill.getTime() + getConfig(id).respawnMs;
+    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1226,7 +1105,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const id = interaction.customId.replace("missed_kill_", "");
     const boss = BOSSES.find(b => b.id === id);
     const now = Date.now();
-    const respawnTime = now + getConfig(id).respawnMs;
+    const respawnTime = now + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1256,7 +1135,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const boss = BOSSES.find(b => b.id === id);
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
     const kill = parseServerTime(h, m);
-    const respawnTime = kill.getTime() + getConfig(id).respawnMs;
+    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1299,7 +1178,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const boss = BOSSES.find(b => b.id === id);
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
     const kill = parseServerTime(h, m);
-    const respawnTime = kill.getTime() + getConfig(id).respawnMs;
+    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
     data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `MANUAL SET ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
