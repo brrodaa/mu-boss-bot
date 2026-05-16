@@ -607,6 +607,110 @@ function buildMissedWindowComponents(id) {
 // =====================
 // DASHBOARD EMBED
 // =====================
+function buildDirectBossEntry(b, now) {
+  const e = data.kills[b.id];
+  if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY\n👤 None`, isBroken: false };
+
+  const config        = getConfig(b.id);
+  const cooldown      = e.respawnTime - now;
+  const windowEnd     = e.respawnTime + config.windowMs;
+  const windowLeft    = windowEnd - now;
+  const isMissed      = !!missedWindowMessages[b.id];
+  const missedTimes   = missedCount[b.id] || 0;
+  const missedLabel   = missedTimes >= 2
+    ? `⚠️ Timer wrong (${missedTimes}x missed) — update manually!`
+    : `⚠️ Timer possibly wrong (1st miss)`;
+  let text, isBroken  = false;
+
+  if (cooldown > 0) {
+    const tsRespawn = Math.floor(e.respawnTime / 1000);
+    if (isMissed) {
+      const missedNote = missedTimes >= 2 ? `🚨 Missed ${missedTimes}x in a row — probably needs update manually!` : `1st missed window — timer may be off`;
+      text = [
+        `⚠️ Timer possibly wrong — waiting for respawn`,
+        missedNote,
+        `🕒 Expected: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
+        `⏳ Time left: ${format(cooldown)}`,
+        `👤 Last updated by: ${e.lastKiller}`,
+      ].join('\n');
+      isBroken = true;
+    } else {
+      text = `🔴 ${format(cooldown)}\n🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
+    }
+  } else if (windowLeft > 0) {
+    const tsRespawn = Math.floor(e.respawnTime / 1000);
+    text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
+  } else {
+    const nextWindowOpen  = e.respawnTime + config.respawnMs;
+    const nextWindowClose = e.respawnTime + config.respawnMs + config.windowMs;
+    const tsRespawn = Math.floor(e.respawnTime       / 1000);
+    const tsOpen    = Math.floor(nextWindowOpen      / 1000);
+    const tsClose   = Math.floor(nextWindowClose     / 1000);
+    const nextLine  = nextWindowClose > now
+      ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)\n    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
+      : `🔄 Next window also passed — update manually`;
+    text = [
+      missedLabel,
+      `🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
+      nextLine,
+      `👤 Last updated by: ${e.lastKiller}`,
+    ].join('\n');
+    isBroken = true;
+  }
+
+  return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
+}
+
+function buildGroupedBossEntry(type, now) {
+  const typeBosses = BOSSES.filter(b => b.type === type);
+  const label      = type.charAt(0).toUpperCase() + type.slice(1);
+  const lines      = [];
+  let minTimeLeft  = Infinity;
+  let anyBroken    = false;
+
+  for (const b of typeBosses) {
+    const e          = data.kills[b.id];
+    const sLabel     = b.name.replace(/^\S+\s*/, "");
+
+    if (!e) {
+      lines.push(`**${sLabel}**: 🟢 READY`);
+      minTimeLeft = 0;
+      continue;
+    }
+
+    const cfg        = getConfig(b.id);
+    const cooldown   = e.respawnTime - now;
+    const windowEnd  = e.respawnTime + cfg.windowMs;
+    const windowLeft = windowEnd - now;
+    const isMissed   = !!missedWindowMessages[b.id];
+    const missedTimes = missedCount[b.id] || 0;
+    const tsRespawn  = Math.floor(e.respawnTime / 1000);
+    const timeLeft   = Math.max(cooldown, windowLeft);
+    if (timeLeft < minTimeLeft) minTimeLeft = timeLeft;
+
+    if (cooldown > 0) {
+      if (isMissed) {
+        anyBroken = true;
+        lines.push(`**${sLabel}**: ⚠️ ~${format(cooldown)} — <t:${tsRespawn}:t> — 👤 ${e.lastKiller}`);
+      } else {
+        lines.push(`**${sLabel}**: 🔴 ${format(cooldown)} — <t:${tsRespawn}:t> — 👤 ${e.lastKiller}`);
+      }
+    } else if (windowLeft > 0) {
+      lines.push(`**${sLabel}**: 🟢 WINDOW ${format(windowLeft)} — <t:${tsRespawn}:t> — 👤 ${e.lastKiller}`);
+    } else {
+      anyBroken = true;
+      if (missedTimes >= 2) {
+        lines.push(`**${sLabel}**: 🚨 Wrong (${missedTimes}x missed) — 👤 ${e.lastKiller}`);
+      } else {
+        lines.push(`**${sLabel}**: ⚠️ Missed — 👤 ${e.lastKiller}`);
+      }
+    }
+  }
+
+  if (minTimeLeft === Infinity) minTimeLeft = 0;
+  return { name: label, timeLeft: minTimeLeft, text: lines.join('\n'), isBroken: anyBroken };
+}
+
 function buildEmbed() {
   const now   = Date.now();
   const embed = new EmbedBuilder()
@@ -614,67 +718,26 @@ function buildEmbed() {
     .setColor(0xffaa00)
     .setFooter({ text: "Auto-updates every 15s" });
 
-  const bosses = BOSSES.map(b => {
-    const e = data.kills[b.id];
-    if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY\n👤 None`, isBroken: false };
+  const entries = [];
 
-    const config        = getConfig(b.id);
-    const cooldown      = e.respawnTime - now;
-    const windowEnd     = e.respawnTime + config.windowMs;
-    const windowLeft    = windowEnd - now;
-    const isMissed      = !!missedWindowMessages[b.id];
-    const missedTimes   = missedCount[b.id] || 0;
-    const missedLabel   = missedTimes >= 2
-      ? `⚠️ Timer wrong (${missedTimes}x missed) — update manually!`
-      : `⚠️ Timer possibly wrong (1st miss)`;
-    let text, isBroken  = false;
+  for (const b of BOSSES) {
+    if (!MENU_BOSS_TYPES.has(b.type)) entries.push(buildDirectBossEntry(b, now));
+  }
 
-    if (cooldown > 0) {
-      const tsRespawn = Math.floor(e.respawnTime / 1000);
-      if (isMissed) {
-        const missedNote = missedTimes >= 2 ? `🚨 Missed ${missedTimes}x in a row — probably needs update manually!` : `1st missed window — timer may be off`;
-        text = [
-          `⚠️ Timer possibly wrong — waiting for respawn`,
-          missedNote,
-          `🕒 Expected: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
-          `⏳ Time left: ${format(cooldown)}`,
-          `👤 Last updated by: ${e.lastKiller}`,
-        ].join('\n');
-        isBroken = true;
-      } else {
-        text = `🔴 ${format(cooldown)}\n🕒 ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
-      }
-    } else if (windowLeft > 0) {
-      const tsRespawn = Math.floor(e.respawnTime / 1000);
-      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
-    } else {
-      const nextWindowOpen  = e.respawnTime + config.respawnMs;
-      const nextWindowClose = e.respawnTime + config.respawnMs + config.windowMs;
-      const tsRespawn = Math.floor(e.respawnTime       / 1000);
-      const tsOpen    = Math.floor(nextWindowOpen      / 1000);
-      const tsClose   = Math.floor(nextWindowClose     / 1000);
-      const nextLine  = nextWindowClose > now
-        ? `🔄 Next window: ${toServerTimeStr(nextWindowOpen)} – ${toServerTimeStr(nextWindowClose)} (server)\n    <t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
-        : `🔄 Next window also passed — update manually`;
-      text = [
-        missedLabel,
-        `🕒 Last known respawn: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`,
-        nextLine,
-        `👤 Last updated by: ${e.lastKiller}`,
-      ].join('\n');
-      isBroken = true;
-    }
+  const seenTypes = new Set();
+  for (const b of BOSSES) {
+    if (!MENU_BOSS_TYPES.has(b.type) || seenTypes.has(b.type)) continue;
+    seenTypes.add(b.type);
+    entries.push(buildGroupedBossEntry(b.type, now));
+  }
 
-    return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
-  });
-
-  bosses.sort((a, b) => {
+  entries.sort((a, b) => {
     if (a.isBroken && !b.isBroken) return 1;
     if (!a.isBroken && b.isBroken) return -1;
     return a.timeLeft - b.timeLeft;
   });
 
-  for (const b of bosses) embed.addFields({ name: `• ${b.name}`, value: b.text });
+  for (const e of entries) embed.addFields({ name: `• ${e.name}`, value: e.text });
   return embed;
 }
 
