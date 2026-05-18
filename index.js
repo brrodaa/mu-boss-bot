@@ -83,71 +83,15 @@ const STARTUP_GRACE_MS = 30 * 1000;
 // =====================
 function buildBosses() {
   const bosses = [];
-
-  // Original bosses
   for (let i = 1; i <= 3; i++) bosses.push({ id: `lorencia_${i}`, name: `Kharzul #${i}`,         type: "kharzul" });
   for (let i = 1; i <= 3; i++) bosses.push({ id: `davias_${i}`,   name: `Vescrya #${i}`,          type: "vescrya" });
   for (let i = 1; i <= 2; i++) bosses.push({ id: `crywolf_${i}`,  name: `Muggron #${i} Crywolf`,  type: "muggron" });
   for (let i = 1; i <= 2; i++) bosses.push({ id: `barracks_${i}`, name: `Muggron #${i} Barracks`, type: "muggron" });
-
-  // Cryonox — Twisted Karutan: 4 per server, 3 servers
-  for (let s = 1; s <= 3; s++) {
-    for (let i = 1; i <= 4; i++) {
-      bosses.push({
-        id:       `cryonox_karutan_s${s}_${i}`,
-        name:     `Cryonox #${i} Karutan S${s}`,
-        type:     "cryonox",
-        location: "Twisted Karutan",
-        server:   s,
-        slot:     i,
-      });
-    }
-  }
-
-  // Cryonox — Land of Trials: 2
-  for (let i = 1; i <= 2; i++) {
-    bosses.push({
-      id:       `cryonox_trials_${i}`,
-      name:     `Cryonox #${i} Trials`,
-      type:     "cryonox",
-      location: "Land of Trials",
-      server:   null,
-      slot:     i,
-    });
-  }
-
   return bosses;
 }
 const BOSSES = buildBosses();
 
-// Boss-type configuration overrides
-// respawnMs:       cooldown from kill until the spawn WINDOW OPENS (stored as respawnTime)
-// respawnWindowMs: how long the spawn window stays open after respawnTime
-// missedAdvanceMs: how much to shift respawnTime forward on a missed window
-// maxMissed:       max auto-advance cycles before stopping
-//
-// Default (Kharzul/Vescrya/Muggron): kill → 7h cooldown → window opens → 1h window
-// Cryonox:                           kill → 5h cooldown → window opens → 2h window
-const BOSS_TYPE_CONFIG = {
-  default: {
-    respawnMs:       7 * 60 * 60 * 1000,
-    respawnWindowMs: 60 * 60 * 1000,
-    missedAdvanceMs: 7 * 60 * 60 * 1000,
-    maxMissed:       Infinity,
-  },
-  cryonox: {
-    respawnMs:       5 * 60 * 60 * 1000, // 5h cooldown → window opens
-    respawnWindowMs: 2 * 60 * 60 * 1000, // 2h window
-    missedAdvanceMs: 1 * 60 * 60 * 1000, // shift window +1h per miss
-    maxMissed:       2,
-  },
-};
-
-function bossConfig(boss) {
-  return BOSS_TYPE_CONFIG[boss.type] ?? BOSS_TYPE_CONFIG.default;
-}
-
-const TRACKED_BOSS_TYPES = new Set(["kharzul", "vescrya", "cryonox"]);
+const TRACKED_BOSS_TYPES = new Set(["kharzul", "vescrya"]);
 
 // =====================
 // FIXED EVENTS
@@ -194,14 +138,6 @@ const FIXED_EVENTS = [
     times: ["23:50"],
     warnMinutes: 5,
     extraNote: "📍 Location: **Crimson Icarus** | 🎁 Drop: Wing 2, Phoenix Feather, Wing 2.5",
-  },
-
-  // ── Frigidons — fixed every 3h starting 00:00, 3 monsters in Ruined Devias ──
-  {
-    name: "❄️ Frigidons",
-    times: ["00:00","03:00","06:00","09:00","12:00","15:00","18:00","21:00"],
-    warnMinutes: 5,
-    extraNote: "📍 Location: **Ruined Devias** | 3 monsters spawn simultaneously",
   },
 ];
 
@@ -288,17 +224,18 @@ function restoreSpawnWarningFlags() {
   const now = Date.now();
 
   for (const b of BOSSES) {
-    const cfg = bossConfig(b);
-    const e   = data.kills[b.id];
+    const e = data.kills[b.id];
     if (!e) {
       spawnWarnings[b.id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
       continue;
     }
 
     const cooldown      = e.respawnTime - now;
-    const windowEnd     = e.respawnTime + cfg.respawnWindowMs;
+    const windowEnd     = e.respawnTime + 60 * 60 * 1000;
     const windowExpired = now > windowEnd;
 
+    // warned5: true whenever we are within 5 min of respawn OR past it.
+    // This covers restarts during the last-5-min countdown window.
     spawnWarnings[b.id] = {
       warned5:       cooldown <= 5 * 60 * 1000,
       warned20:      cooldown <= 0 && (windowEnd - now) <= 20 * 60 * 1000,
@@ -306,9 +243,12 @@ function restoreSpawnWarningFlags() {
       missedHandled: windowExpired,
     };
 
+    // After handleMissedWindow auto-advances, e.respawnTime is the NEW respawnTime.
+    // The missed window opens AT that new respawnTime and closes 2h later.
+    // Restore the entry with flags pre-set so tickMissedWindowPings doesn't re-fire.
     if (windowExpired && TRACKED_BOSS_TYPES.has(b.type)) {
       const nextWindowStart = e.respawnTime;
-      const nextWindowEnd   = e.respawnTime + cfg.respawnWindowMs * 2; // missed window is double
+      const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
       const untilEnd        = nextWindowEnd - now;
 
       if (untilEnd + WINDOW_GRACE_MS > 0) {
@@ -597,6 +537,8 @@ async function postEveryoneWarning(channel, key, content, lifespanMs = EVERYONE_
 }
 
 function scheduleEveryoneWarningCycle(channel, key, content, msg, lifespanMs = EVERYONE_WARNING_LIFESPAN_MS) {
+  // No repin — reposting sends a second @everyone notification.
+  // Message stays until lifespan expires, then gets deleted and forwarded to log.
   const deleteTimer = setTimeout(() => {
     if (!everyoneWarnings[key]) return;
     everyoneWarnings[key].msg.delete().catch(() => {});
@@ -622,10 +564,8 @@ function buildSpawnWindowEmbed(boss, windowStart, windowEnd) {
   const remaining = windowEnd - Date.now();
   const tsStart   = Math.floor(windowStart / 1000);
   const tsEnd     = Math.floor(windowEnd / 1000);
-  const cfg       = bossConfig(boss);
-  const windowLabel = cfg.respawnWindowMs >= 2 * 60 * 60 * 1000 ? "2h window" : "1h window";
   const desc = remaining > 0
-    ? `⏳ Time left: **${formatSeconds(remaining)}** (${windowLabel})\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closes: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
+    ? `⏳ Time left: **${formatSeconds(remaining)}**\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closes: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`
     : `⌛ Window has closed — log the kill or wait for next respawn\n🟢 Opened: ${toServerTimeStr(windowStart)} (server) — <t:${tsStart}:t> (your time)\n🔴 Closed: ${toServerTimeStr(windowEnd)} (server) — <t:${tsEnd}:t> (your time)`;
   return new EmbedBuilder()
     .setTitle(`🟢 ${boss.name} — Spawn window active`)
@@ -647,8 +587,6 @@ function buildMissedWindowEmbed(boss, windowStart, windowEnd) {
   const now        = Date.now();
   const untilStart = windowStart - now;
   const untilEnd   = windowEnd   - now;
-  const cfg        = bossConfig(boss);
-  const maxMissed  = cfg.maxMissed === Infinity ? "" : ` (max ${cfg.maxMissed})`;
 
   let statusLine;
   if (untilStart > 0) {
@@ -667,7 +605,7 @@ function buildMissedWindowEmbed(boss, windowStart, windowEnd) {
     .setDescription(
       `${statusLine}\n\n` +
       `> ⚠️ **This timer might be incorrect and/or it will take longer for respawn.**\n` +
-      `> The previous window passed without a kill being logged.${maxMissed}`
+      `> The previous window passed without a kill being logged.`
     )
     .setFooter({ text: `Auto-updating | Window: ${toServerTimeStr(windowStart)} – ${toServerTimeStr(windowEnd)} (server)` });
 }
@@ -689,36 +627,24 @@ function buildEmbed() {
     .setColor(0xffaa00)
     .setFooter({ text: "Auto-updates every 15s" });
 
-  // Group Cryonox separately for cleaner display
-  const regularBosses = BOSSES.filter(b => b.type !== "cryonox");
-  const cryonoxBosses = BOSSES.filter(b => b.type === "cryonox");
-
-  const renderBoss = (b) => {
-    const cfg = bossConfig(b);
-    const e   = data.kills[b.id];
+  const bosses = BOSSES.map(b => {
+    const e = data.kills[b.id];
     if (!e) return { name: b.name, timeLeft: 0, text: `🟢 READY\n👤 None`, isBroken: false };
 
     const cooldown      = e.respawnTime - now;
-    const windowEnd     = e.respawnTime + cfg.respawnWindowMs;
+    const windowEnd     = e.respawnTime + 60 * 60 * 1000;
     const windowLeft    = windowEnd - now;
     const isMissed      = !!missedWindowMessages[b.id];
     const missedTimes   = missedCount[b.id] || 0;
-    const atMaxMissed   = cfg.maxMissed !== Infinity && missedTimes >= cfg.maxMissed;
-    const missedLabel   = atMaxMissed
-      ? `🚫 Max missed windows reached (${missedTimes}x) — update manually!`
-      : missedTimes >= 2
-        ? `⚠️ Timer wrong (${missedTimes}x missed) — update manually!`
-        : `⚠️ Timer possibly wrong (1st miss)`;
+    const missedLabel   = missedTimes >= 2
+      ? `⚠️ Timer wrong (${missedTimes}x missed) — update manually!`
+      : `⚠️ Timer possibly wrong (1st miss)`;
     let text, isBroken  = false;
 
     if (cooldown > 0) {
       const tsRespawn = Math.floor(e.respawnTime / 1000);
       if (isMissed) {
-        const missedNote = atMaxMissed
-          ? `🚫 Max missed windows reached — needs manual update!`
-          : missedTimes >= 2
-            ? `🚨 Missed ${missedTimes}x in a row — probably needs update manually!`
-            : `1st missed window — timer may be off`;
+        const missedNote = missedTimes >= 2 ? `🚨 Missed ${missedTimes}x in a row — probably needs update manually!` : `1st missed window — timer may be off`;
         text = [
           `⚠️ Timer possibly wrong — waiting for respawn`,
           missedNote,
@@ -732,11 +658,10 @@ function buildEmbed() {
       }
     } else if (windowLeft > 0) {
       const tsRespawn = Math.floor(e.respawnTime / 1000);
-      const winLabel  = cfg.respawnWindowMs >= 2 * 60 * 60 * 1000 ? "2h WINDOW" : "WINDOW";
-      text = `🟢 ${winLabel} — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
+      text = `🟢 WINDOW — ⏳ ${format(windowLeft)}\n🕒 Was due: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)\n👤 ${e.lastKiller}`;
     } else {
-      const nextWindowOpen  = e.respawnTime + cfg.respawnWindowMs;
-      const nextWindowClose = e.respawnTime + cfg.respawnWindowMs * 2;
+      const nextWindowOpen  = e.respawnTime + 60 * 60 * 1000;
+      const nextWindowClose = e.respawnTime + 2 * 60 * 60 * 1000;
       const tsRespawn = Math.floor(e.respawnTime   / 1000);
       const tsOpen    = Math.floor(nextWindowOpen  / 1000);
       const tsClose   = Math.floor(nextWindowClose / 1000);
@@ -753,31 +678,15 @@ function buildEmbed() {
     }
 
     return { name: b.name, timeLeft: Math.max(cooldown, windowLeft), text, isBroken };
-  };
+  });
 
-  // Sort and add regular bosses
-  const regularRendered = regularBosses.map(renderBoss);
-  regularRendered.sort((a, b) => {
+  bosses.sort((a, b) => {
     if (a.isBroken && !b.isBroken) return 1;
     if (!a.isBroken && b.isBroken) return -1;
     return a.timeLeft - b.timeLeft;
   });
-  for (const b of regularRendered) embed.addFields({ name: `• ${b.name}`, value: b.text });
 
-  // Add Cryonox bosses — all rendered under one section header (no sub-headers to stay under 25 field limit)
-  if (cryonoxBosses.length > 0) {
-    embed.addFields({ name: "━━━━━━━━━━━━━━━━━━━━━━━━", value: "❄️ **CRYONOX** (5h cooldown + 2h window)" });
-
-    // Render all Cryonox; location/server already in boss.name (e.g. "Cryonox #1 Karutan S2")
-    const allCryRendered = cryonoxBosses.map(renderBoss);
-    allCryRendered.sort((a, b_) => {
-      if (a.isBroken && !b_.isBroken) return 1;
-      if (!a.isBroken && b_.isBroken) return -1;
-      return a.timeLeft - b_.timeLeft;
-    });
-    for (const b of allCryRendered) embed.addFields({ name: `• ${b.name}`, value: b.text });
-  }
-
+  for (const b of bosses) embed.addFields({ name: `• ${b.name}`, value: b.text });
   return embed;
 }
 
@@ -792,28 +701,19 @@ function chunk(arr, size) {
 
 function buildButtons() {
   const rows = [];
-
-  // Original bosses only (Kharzul, Vescrya, Muggron)
-  const regularBosses = BOSSES.filter(b => b.type !== "cryonox");
-  for (const group of chunk(regularBosses, 5)) {
+  for (const group of chunk(BOSSES, 5)) {
     const row = new ActionRowBuilder();
     for (const b of group)
       row.addComponents(new ButtonBuilder().setCustomId("kill_" + b.id).setLabel(b.name.slice(0, 20)).setStyle(ButtonStyle.Primary));
     rows.push(row);
   }
-
-  // Cryonox button — opens a server+slot selection flow
-  // Limit to 5 rows total for Discord. We add Cryonox to the last admin row or a new row.
   rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("cryonox_pick").setLabel("❄️ Cryonox").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("insert_time").setLabel("📝 Insert").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("reset_all").setLabel("🧹 Reset").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId("undo").setLabel("↩️ Undo").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("show_logs").setLabel("📜 Logs").setStyle(ButtonStyle.Secondary)
   ));
-
-  // Discord maximum is 5 action rows — trim if needed
-  return rows.slice(0, 5);
+  return rows;
 }
 
 // =====================
@@ -863,8 +763,7 @@ async function repinDashboard(channel) {
 // =====================
 async function createSpawnWindow(boss, id, channel, windowEnd) {
   if (spawnWindowMessages[id]) return;
-  const cfg         = bossConfig(boss);
-  const windowStart = windowEnd - cfg.respawnWindowMs;
+  const windowStart = windowEnd - 60 * 60 * 1000;
   const msg = await channel.send({
     embeds: [buildSpawnWindowEmbed(boss, windowStart, windowEnd)],
     components: buildSpawnWindowComponents(id), flags: MessageFlags.SuppressNotifications
@@ -880,61 +779,39 @@ async function createSpawnWindow(boss, id, channel, windowEnd) {
 // MISSED WINDOW / AUTO-ADVANCE
 // =====================
 async function handleMissedWindow(boss, id, channel) {
-  const e   = data.kills[id];
-  const cfg = bossConfig(boss);
+  const e = data.kills[id];
   if (!e) return;
 
-  // Check if we've reached the max missed windows for this boss type
-  const currentCount = missedCount[id] || 0;
-  if (cfg.maxMissed !== Infinity && currentCount >= cfg.maxMissed) {
-    console.log(`[MissedWindow] ${boss.name} has reached max missed windows (${cfg.maxMissed}) — no more auto-advance.`);
-    // Post a final alert if not already one active
-    const key = `${id}_stale_timer`;
-    if (!everyoneWarnings[key]) {
-      const tsRespawn = Math.floor(e.respawnTime / 1000);
-      const content =
-        `@everyone 🚫 **${boss.name}** has reached the maximum missed windows (${cfg.maxMissed}x)!\n` +
-        `The timer cannot be auto-corrected further — please find and log the boss manually.\n` +
-        `📍 Last estimated respawn: ${toServerTimeStr(e.respawnTime)} (server) — <t:${tsRespawn}:t> (your time)`;
-      postEveryoneWarning(channel, key, content, 30 * 60 * 1000);
-    }
-    return;
-  }
+  // Track how many times this boss has been auto-advanced
+  missedCount[id] = (missedCount[id] || 0) + 1;
+  const count = missedCount[id];
 
-  // Increment missed count
-  missedCount[id] = currentCount + 1;
-  const count     = missedCount[id];
-
-  console.log(`[MissedWindow] No kill for ${boss.name} — auto-advancing ${format(cfg.missedAdvanceMs)} (advance #${count})`);
+  console.log(`[MissedWindow] No kill for ${boss.name} — auto-advancing 7h (advance #${count})`);
   snapshot();
-  e.respawnTime = e.respawnTime + cfg.missedAdvanceMs;
-  e.killTime    = e.respawnTime - cfg.missedAdvanceMs;
+  e.respawnTime = e.respawnTime + 7 * 60 * 60 * 1000;
+  e.killTime    = e.respawnTime - 7 * 60 * 60 * 1000;
   save();
   spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
   clearBossCards(id);
 
   const nextWindowStart = e.respawnTime;
-  const nextWindowEnd   = e.respawnTime + cfg.respawnWindowMs; // next missed window uses normal respawnWindowMs
+  const nextWindowEnd   = e.respawnTime + 2 * 60 * 60 * 1000;
   missedWindowMessages[id] = {
     msg: null, deleteTimer: null,
     nextWindowStart, nextWindowEnd,
     pingedStart: false, pinged1h: false, pinged20min: false, boss,
   };
 
-  // Fire stale timer alert on 2nd+ advance (or always for cryonox since maxMissed=2)
+  // On the 2nd+ auto-advance, fire a special @everyone alert so the team
+  // knows to look for the boss in the world and update the timer manually.
   if (count >= 2) {
     const tsOpen  = Math.floor(nextWindowStart / 1000);
     const tsClose = Math.floor(nextWindowEnd   / 1000);
-    const atMax   = cfg.maxMissed !== Infinity && count >= cfg.maxMissed;
-    const content = atMax
-      ? `@everyone 🚫 **${boss.name}** has missed its spawn window **${count} times** — this is the final auto-advance!\n` +
-        `Please find and kill the boss to reset the timer.\n` +
-        `📍 Final estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)\n` +
-        `<t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`
-      : `@everyone 🚨 **${boss.name}** has missed its spawn window **${count} times** in a row!\n` +
-        `The timer is likely wrong — please find and kill the boss to reset it.\n` +
-        `📍 Next estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)\n` +
-        `<t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`;
+    const content =
+      `@everyone 🚨 **${boss.name}** has missed its spawn window **${count} times** in a row!\n` +
+      `The timer is likely wrong — please find and kill the boss to reset it.\n` +
+      `📍 Next estimated window: ${toServerTimeStr(nextWindowStart)} – ${toServerTimeStr(nextWindowEnd)} (server)\n` +
+      `<t:${tsOpen}:t> — <t:${tsClose}:t> (your time)`;
     postEveryoneWarning(channel, `${id}_stale_timer`, content, 30 * 60 * 1000);
   }
 }
@@ -1037,12 +914,11 @@ function checkWarnings(channel) {
   if (now - BOT_START_TIME < STARTUP_GRACE_MS) return;
 
   for (const b of BOSSES) {
-    const cfg = bossConfig(b);
-    const e   = data.kills[b.id];
+    const e = data.kills[b.id];
     if (!e) continue;
 
     const cooldown               = e.respawnTime - now;
-    const windowEnd              = e.respawnTime + cfg.respawnWindowMs;
+    const windowEnd              = e.respawnTime + 60 * 60 * 1000;
     const windowLeft             = windowEnd - now;
     const timeSinceWindowExpired = now - windowEnd;
 
@@ -1087,6 +963,7 @@ async function checkFixedEvents(channel) {
       const warnMs    = ev.warnMinutes * 60 * 1000;
       const timeUntil = eventMs - now;
 
+      // Window: (warnMs + 1min) before down to 1 tick after the warn time.
       if (timeUntil > warnMs + (1 * 60 * 1000) || timeUntil < -TICK_RATE) continue;
 
       const eventDate = new Date(eventMs).toLocaleDateString("en-CA", { timeZone: SERVER_TZ });
@@ -1135,7 +1012,6 @@ function clearBossCards(id) {
   clearEveryoneWarning(`${id}_missed_start`);
   clearEveryoneWarning(`${id}_missed_1h`);
   clearEveryoneWarning(`${id}_missed_20min`);
-  clearEveryoneWarning(`${id}_stale_timer`);
 }
 
 // =====================
@@ -1147,6 +1023,7 @@ client.once(Events.ClientReady, async () => {
 
   if (await recoverFromDiscordBackup()) console.log("[Recovery] Timers restored.");
 
+  // Must run after load/recovery — prevents all @everyone warnings from re-firing on restart
   restoreSpawnWarningFlags();
 
   const channel = await client.channels.fetch(CHANNEL_ID);
@@ -1175,14 +1052,13 @@ client.on(Events.InteractionCreate, async interaction => {
     repostBackupToBottom();
   }
 
-  // ── KILL BUTTON (regular bosses) ──
+  // ── KILL BUTTON ──
   if (interaction.isButton() && interaction.customId.startsWith("kill_")) {
     snapshot();
-    const id   = interaction.customId.replace("kill_", "");
+    const id = interaction.customId.replace("kill_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const cfg  = bossConfig(boss);
-    const now  = Date.now();
-    const respawnTime = now + cfg.respawnMs;
+    const now = Date.now();
+    const respawnTime = now + 7 * 60 * 60 * 1000;
     data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `KILLED ${boss.name} — kill: ${toServerDateTimeStr(now)} — respawn: ${toServerDateTimeStr(respawnTime)}`);
@@ -1193,105 +1069,13 @@ client.on(Events.InteractionCreate, async interaction => {
     return interaction.deferUpdate();
   }
 
-  // ── CRYONOX PICKER — step 1: choose location ──
-  if (interaction.isButton() && interaction.customId === "cryonox_pick") {
-    log(interaction.user, `Opened Cryonox location picker`);
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId("cryonox_location")
-      .setPlaceholder("Select location")
-      .addOptions([
-        { label: "🌀 Twisted Karutan — Server 1", value: "karutan_s1" },
-        { label: "🌀 Twisted Karutan — Server 2", value: "karutan_s2" },
-        { label: "🌀 Twisted Karutan — Server 3", value: "karutan_s3" },
-        { label: "🏔️ Land of Trials",             value: "trials"    },
-      ]);
-    return interaction.reply({
-      content: "❄️ **Cryonox** — Select location:",
-      components: [new ActionRowBuilder().addComponents(menu)],
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  // ── CRYONOX PICKER — step 2: after location, pick slot ──
-  if (interaction.isStringSelectMenu() && interaction.customId === "cryonox_location") {
-    const loc = interaction.values[0]; // e.g. "karutan_s1" or "trials"
-    log(interaction.user, `Cryonox location selected: ${loc}`);
-
-    let options;
-    if (loc === "trials") {
-      options = [
-        { label: "Cryonox #1 — Trials", value: "cryonox_trials_1" },
-        { label: "Cryonox #2 — Trials", value: "cryonox_trials_2" },
-      ];
-    } else {
-      const sNum = loc.replace("karutan_s", "");
-      options = [1, 2, 3, 4].map(i => ({
-        label: `Cryonox #${i} — Karutan S${sNum}`,
-        value: `cryonox_karutan_s${sNum}_${i}`,
-      }));
-    }
-
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId("cryonox_slot")
-      .setPlaceholder("Select which Cryonox")
-      .addOptions(options);
-
-    return interaction.update({
-      content: "❄️ **Cryonox** — Select which one was killed:",
-      components: [new ActionRowBuilder().addComponents(menu)],
-    });
-  }
-
-  // ── CRYONOX PICKER — step 3: after slot chosen, show kill-time modal ──
-  if (interaction.isStringSelectMenu() && interaction.customId === "cryonox_slot") {
-    const id   = interaction.values[0];
-    const boss = BOSSES.find(b => b.id === id);
-    log(interaction.user, `Cryonox slot selected: ${boss.name} — opening kill-time modal`);
-
-    const modal = new ModalBuilder()
-      .setCustomId(`cryonox_killtime_${id}`)
-      .setTitle(`Kill Time — ${boss.name}`);
-    modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId("time")
-        .setLabel("Kill time HH:MM (24h, server time)")
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder("e.g. 14:35")
-        .setRequired(true)
-    ));
-    return interaction.showModal(modal);
-  }
-
-  // ── CRYONOX — modal submit (kill time) ──
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("cryonox_killtime_")) {
-    snapshot();
-    const id   = interaction.customId.replace("cryonox_killtime_", "");
-    const boss = BOSSES.find(b => b.id === id);
-    const cfg  = bossConfig(boss);
-    const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
-    const kill    = parseServerTime(h, m);
-    // respawnTime = kill + 5h (window opens); windowEnd = kill + 7h (window closes)
-
-    const respawnTime = kill.getTime() + cfg.respawnMs;
-    const windowEndCry = respawnTime + cfg.respawnWindowMs;
-    clearBossCards(id);
-    data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
-    save();
-    log(interaction.user, `CRYONOX SET ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — window: ${toServerDateTimeStr(respawnTime)} – ${toServerDateTimeStr(windowEndCry)}`);
-    spawnWarnings[id] = { warned5: false, warned20: false, windowCreated: false, missedHandled: false };
-    await announceKill(interaction.channel, interaction.user, `logged **${boss.name}** kill`,
-      `🕒 Kill: ${toServerDateTimeStr(kill.getTime())}\n🟢 Window opens: ${toServerDateTimeStr(respawnTime)} — 🔴 Closes: ${toServerDateTimeStr(windowEndCry)}`);
-    return interaction.deferUpdate();
-  }
-
   // ── WINDOW KILL ──
   if (interaction.isButton() && interaction.customId.startsWith("window_kill_")) {
     snapshot();
-    const id   = interaction.customId.replace("window_kill_", "");
+    const id = interaction.customId.replace("window_kill_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const cfg  = bossConfig(boss);
-    const now  = Date.now();
-    const respawnTime = now + cfg.respawnMs;
+    const now = Date.now();
+    const respawnTime = now + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1304,7 +1088,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ── WINDOW SET TIME — show modal ──
   if (interaction.isButton() && interaction.customId.startsWith("window_settime_")) {
-    const id   = interaction.customId.replace("window_settime_", "");
+    const id = interaction.customId.replace("window_settime_", "");
     const boss = BOSSES.find(b => b.id === id);
     log(interaction.user, `Opened set-time modal for ${boss.name} (window)`);
     const modal = new ModalBuilder().setCustomId("window_killtime_" + id).setTitle(`Set Kill Time — ${boss.name}`);
@@ -1317,12 +1101,11 @@ client.on(Events.InteractionCreate, async interaction => {
   // ── WINDOW SET TIME — modal submit ──
   if (interaction.isModalSubmit() && interaction.customId.startsWith("window_killtime_")) {
     snapshot();
-    const id   = interaction.customId.replace("window_killtime_", "");
+    const id = interaction.customId.replace("window_killtime_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const cfg  = bossConfig(boss);
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
-    const kill    = parseServerTime(h, m);
-    const respawnTime = kill.getTime() + cfg.respawnMs;
+    const kill = parseServerTime(h, m);
+    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1336,11 +1119,10 @@ client.on(Events.InteractionCreate, async interaction => {
   // ── MISSED KILL ──
   if (interaction.isButton() && interaction.customId.startsWith("missed_kill_")) {
     snapshot();
-    const id   = interaction.customId.replace("missed_kill_", "");
+    const id = interaction.customId.replace("missed_kill_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const cfg  = bossConfig(boss);
-    const now  = Date.now();
-    const respawnTime = now + cfg.respawnMs;
+    const now = Date.now();
+    const respawnTime = now + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: now, respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1353,7 +1135,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ── MISSED SET TIME — show modal ──
   if (interaction.isButton() && interaction.customId.startsWith("missed_settime_")) {
-    const id   = interaction.customId.replace("missed_settime_", "");
+    const id = interaction.customId.replace("missed_settime_", "");
     const boss = BOSSES.find(b => b.id === id);
     log(interaction.user, `Opened set-time modal for ${boss.name} (missed window)`);
     const modal = new ModalBuilder().setCustomId("missed_killtime_" + id).setTitle(`Set Kill Time — ${boss.name}`);
@@ -1366,12 +1148,11 @@ client.on(Events.InteractionCreate, async interaction => {
   // ── MISSED SET TIME — modal submit ──
   if (interaction.isModalSubmit() && interaction.customId.startsWith("missed_killtime_")) {
     snapshot();
-    const id   = interaction.customId.replace("missed_killtime_", "");
+    const id = interaction.customId.replace("missed_killtime_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const cfg  = bossConfig(boss);
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
-    const kill    = parseServerTime(h, m);
-    const respawnTime = kill.getTime() + cfg.respawnMs;
+    const kill = parseServerTime(h, m);
+    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
     clearBossCards(id);
     data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
@@ -1385,13 +1166,11 @@ client.on(Events.InteractionCreate, async interaction => {
   // ── INSERT TIME — boss picker ──
   if (interaction.isButton() && interaction.customId === "insert_time") {
     log(interaction.user, `Opened insert: boss selection menu`);
-    // Only show non-cryonox bosses here; Cryonox has its own flow via the ❄️ button
-    const insertableBosses = BOSSES.filter(b => b.type !== "cryonox");
     const menu = new StringSelectMenuBuilder()
       .setCustomId("select_boss_insert").setPlaceholder("Select boss")
-      .addOptions(insertableBosses.map(b => ({ label: b.name, value: b.id })));
+      .addOptions(BOSSES.map(b => ({ label: b.name, value: b.id })));
     return interaction.reply({
-      content: "📝 Select boss — enter kill time in server time (HH:MM, 24h):\n*(For Cryonox, use the ❄️ button instead)*",
+      content: "📝 Select boss — enter kill time in server time (HH:MM, 24h):",
       components: [new ActionRowBuilder().addComponents(menu)],
       flags: MessageFlags.Ephemeral
     });
@@ -1399,7 +1178,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ── INSERT TIME — modal trigger ──
   if (interaction.isStringSelectMenu() && interaction.customId === "select_boss_insert") {
-    const id   = interaction.values[0];
+    const id = interaction.values[0];
     const boss = BOSSES.find(b => b.id === id);
     log(interaction.user, `Insert: selected ${boss.name}`);
     const modal = new ModalBuilder().setCustomId(`killtime_server_${id}`).setTitle(`Insert Kill Time — ${boss.name}`);
@@ -1412,12 +1191,11 @@ client.on(Events.InteractionCreate, async interaction => {
   // ── INSERT TIME — modal submit ──
   if (interaction.isModalSubmit() && interaction.customId.startsWith("killtime_server_")) {
     snapshot();
-    const id   = interaction.customId.replace("killtime_server_", "");
+    const id = interaction.customId.replace("killtime_server_", "");
     const boss = BOSSES.find(b => b.id === id);
-    const cfg  = bossConfig(boss);
     const [h, m] = interaction.fields.getTextInputValue("time").split(":").map(Number);
-    const kill    = parseServerTime(h, m);
-    const respawnTime = kill.getTime() + cfg.respawnMs;
+    const kill = parseServerTime(h, m);
+    const respawnTime = kill.getTime() + 7 * 60 * 60 * 1000;
     data.kills[id] = { killTime: kill.getTime(), respawnTime, lastKiller: interaction.user.username };
     save();
     log(interaction.user, `MANUAL SET ${boss.name} — kill: ${toServerDateTimeStr(kill.getTime())} — respawn: ${toServerDateTimeStr(respawnTime)}`);
