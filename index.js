@@ -764,33 +764,18 @@ function buildEmbed() {
   });
   for (const b of regularRendered) embed.addFields({ name: `• ${b.name}`, value: b.text });
 
-  // Add Cryonox section header and group by location/server
+  // Add Cryonox bosses — all rendered under one section header (no sub-headers to stay under 25 field limit)
   if (cryonoxBosses.length > 0) {
     embed.addFields({ name: "━━━━━━━━━━━━━━━━━━━━━━━━", value: "❄️ **CRYONOX** (5h cooldown + 2h window)" });
 
-    // Twisted Karutan — group per server
-    for (let s = 1; s <= 3; s++) {
-      const serverBosses = cryonoxBosses.filter(b => b.location === "Twisted Karutan" && b.server === s);
-      const rendered     = serverBosses.map(renderBoss);
-      rendered.sort((a, b_) => {
-        if (a.isBroken && !b_.isBroken) return 1;
-        if (!a.isBroken && b_.isBroken) return -1;
-        return a.timeLeft - b_.timeLeft;
-      });
-      embed.addFields({ name: `🌀 Twisted Karutan — Server ${s}`, value: "\u200b" });
-      for (const b of rendered) embed.addFields({ name: `  • ${b.name}`, value: b.text });
-    }
-
-    // Land of Trials
-    const trialsBosses = cryonoxBosses.filter(b => b.location === "Land of Trials");
-    const trialsRendered = trialsBosses.map(renderBoss);
-    trialsRendered.sort((a, b_) => {
+    // Render all Cryonox; location/server already in boss.name (e.g. "Cryonox #1 Karutan S2")
+    const allCryRendered = cryonoxBosses.map(renderBoss);
+    allCryRendered.sort((a, b_) => {
       if (a.isBroken && !b_.isBroken) return 1;
       if (!a.isBroken && b_.isBroken) return -1;
       return a.timeLeft - b_.timeLeft;
     });
-    embed.addFields({ name: `🏔️ Land of Trials`, value: "\u200b" });
-    for (const b of trialsRendered) embed.addFields({ name: `  • ${b.name}`, value: b.text });
+    for (const b of allCryRendered) embed.addFields({ name: `• ${b.name}`, value: b.text });
   }
 
   return embed;
